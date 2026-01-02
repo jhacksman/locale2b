@@ -15,10 +15,22 @@ This service provides:
 
 ## Hardware Requirements
 
-- **CPU**: x86_64 or aarch64 with virtualization support (Intel VT-x or AMD-V)
+- **CPU**: x86_64 or aarch64 with virtualization support (Intel VT-x, AMD-V, or Apple Silicon)
 - **RAM**: Minimum 4GB, recommended 16GB+ for multiple sandboxes
 - **Storage**: SSD recommended for fast rootfs operations
 - **OS**: Linux with KVM support (kernel 4.14+)
+
+### Supported Platforms
+
+| Platform | Status | Quick Start Guide |
+|----------|--------|-------------------|
+| x86_64 Linux (Intel/AMD) | ✅ Fully Supported | [Standard Setup](#quick-start) |
+| aarch64 Linux (ARM64) | ✅ Fully Supported | [Standard Setup](#quick-start) |
+| **Apple Silicon Mac Mini** | ✅ **Supported via Asahi Linux** | **[→ QUICKSTART_ASAHI.md](QUICKSTART_ASAHI.md)** |
+| Raspberry Pi 4 (ARM64) | ⚠️ Untested | Should work with KVM-enabled kernel |
+| AWS Graviton (ARM64) | ✅ Supported | Standard Setup |
+
+**Running on Apple Silicon?** See the dedicated [Asahi Linux Setup Guide](ASAHI_SETUP_GUIDE.md) for detailed instructions.
 
 ### Capacity Planning (16GB RAM host)
 
