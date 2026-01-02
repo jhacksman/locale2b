@@ -6,19 +6,27 @@ Firecracker microVM sandboxes for AI agent code execution.
 """
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import uuid
+import os
 import base64
-from datetime import datetime
 
-from .sandbox_manager import SandboxManager, SandboxConfig
+from .sandbox_manager import SandboxManager
 
 app = FastAPI(
     title="Firecracker Workspace Service",
     description="REST API for managing Firecracker microVM sandboxes",
     version="1.0.0"
+)
+
+# Add CORS middleware for web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Global sandbox manager instance
@@ -143,7 +151,7 @@ async def get_sandbox(sandbox_id: str):
     config = sandbox_manager._active_sandboxes.get(sandbox_id)
     if not config:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     return SandboxResponse(
         sandbox_id=config.sandbox_id,
         status=config.status,
@@ -161,7 +169,7 @@ async def destroy_sandbox(sandbox_id: str):
     """Destroy a sandbox and clean up resources."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         await sandbox_manager.destroy_sandbox(sandbox_id)
         return {"status": "destroyed", "sandbox_id": sandbox_id}
@@ -174,7 +182,7 @@ async def pause_sandbox(sandbox_id: str):
     """Pause a sandbox (snapshot state for later resume)."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         await sandbox_manager.pause_sandbox(sandbox_id)
         return {"status": "paused", "sandbox_id": sandbox_id}
@@ -208,7 +216,7 @@ async def exec_command(sandbox_id: str, request: CommandRequest):
     """Execute a command in the sandbox."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         result = await sandbox_manager.exec_command(
             sandbox_id=sandbox_id,
@@ -234,7 +242,7 @@ async def write_file(sandbox_id: str, request: FileWriteRequest):
     """Write a file to the sandbox filesystem."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         result = await sandbox_manager.write_file(
             sandbox_id=sandbox_id,
@@ -257,7 +265,7 @@ async def read_file(sandbox_id: str, path: str):
     """Read a file from the sandbox filesystem."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         result = await sandbox_manager.read_file(sandbox_id=sandbox_id, path=path)
         return FileReadResponse(
@@ -274,7 +282,7 @@ async def list_files(sandbox_id: str, path: str = "/workspace"):
     """List files in a directory."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         result = await sandbox_manager.list_files(sandbox_id=sandbox_id, path=path)
         if result.get("success"):
@@ -294,7 +302,7 @@ async def upload_file(sandbox_id: str, path: str, file: UploadFile = File(...)):
     """Upload a file to the sandbox."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
-    
+
     try:
         content = await file.read()
         content_b64 = base64.b64encode(content).decode()
@@ -314,6 +322,20 @@ async def upload_file(sandbox_id: str, path: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for the workspace-service console script."""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8080"))
+
+    print(f"Starting Firecracker Workspace Service on {host}:{port}")
+    print(f"Base directory: {sandbox_manager.BASE_DIR}")
+    print(f"Kernels directory: {sandbox_manager.KERNELS_DIR}")
+    print(f"Rootfs directory: {sandbox_manager.ROOTFS_DIR}")
+
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()
