@@ -14,7 +14,7 @@ import shutil
 import uuid
 import asyncio
 from pathlib import Path
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict
 from datetime import datetime
 import logging
@@ -38,58 +38,102 @@ class SandboxConfig:
 
 
 class VsockClient:
-    """Client for communicating with guest agent via vsock."""
-    
+    """Client for communicating with guest agent via vsock.
+
+    Firecracker exposes vsock via a Unix domain socket (uds_path).
+    To connect to the guest, the host:
+    1. Connects to the Unix socket
+    2. Sends "CONNECT <port>\n" to initiate connection to guest
+    3. Receives "OK <local_port>\n" on success
+    4. Then communicates using the length-prefixed JSON protocol
+    """
+
     VSOCK_PORT = 5000
-    
-    def __init__(self, guest_cid: int):
-        self.guest_cid = guest_cid
+    MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB limit
+
+    def __init__(self, uds_path: str):
+        self.uds_path = uds_path
         self.sock = None
-    
+
     def connect(self, timeout: float = 30.0):
-        """Connect to the guest agent with retry."""
-        self.sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-        self.sock.settimeout(timeout)
-        
-        # Retry connection as guest may still be booting
+        """Connect to the guest agent via Firecracker's vsock UDS."""
         start_time = time.time()
+        last_error = None
+
         while time.time() - start_time < timeout:
             try:
-                self.sock.connect((self.guest_cid, self.VSOCK_PORT))
-                return
-            except (ConnectionRefusedError, OSError):
+                # Connect to Firecracker's vsock Unix socket
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(timeout)
+                self.sock.connect(self.uds_path)
+
+                # Send CONNECT command to establish connection to guest port
+                connect_cmd = f"CONNECT {self.VSOCK_PORT}\n"
+                self.sock.sendall(connect_cmd.encode())
+
+                # Read response - should be "OK <local_port>\n"
+                response = b""
+                while b"\n" not in response:
+                    chunk = self.sock.recv(256)
+                    if not chunk:
+                        raise ConnectionError("Connection closed waiting for CONNECT response")
+                    response += chunk
+
+                response_str = response.decode().strip()
+                if response_str.startswith("OK"):
+                    return  # Successfully connected
+                else:
+                    raise ConnectionError(f"CONNECT failed: {response_str}")
+
+            except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+                last_error = e
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except OSError:
+                        pass
+                    self.sock = None
                 time.sleep(0.1)
-        
-        raise ConnectionError(f"Failed to connect to guest CID {self.guest_cid}")
-    
+
+        raise ConnectionError(f"Failed to connect to guest via {self.uds_path}: {last_error}")
+
     def disconnect(self):
         """Disconnect from the guest agent."""
         if self.sock:
             try:
                 self.sock.close()
-            except:
+            except OSError:
                 pass
             self.sock = None
-    
+
     def _send_request(self, request: dict, timeout: float = 300.0) -> dict:
-        """Send a request and receive response."""
+        """Send a request and receive response using length-prefixed JSON protocol."""
         if not self.sock:
             self.connect()
-        
+
         self.sock.settimeout(timeout)
         data = json.dumps(request).encode()
-        
-        # Send length-prefixed message
-        self.sock.send(len(data).to_bytes(4, "big"))
-        self.sock.send(data)
-        
+
+        # Validate message size
+        if len(data) > self.MAX_MESSAGE_SIZE:
+            raise ValueError(f"Message too large: {len(data)} bytes (max {self.MAX_MESSAGE_SIZE})")
+
+        # Send length-prefixed message (use sendall for reliability)
+        self.sock.sendall(len(data).to_bytes(4, "big"))
+        self.sock.sendall(data)
+
         # Receive length-prefixed response
         length_bytes = self._recv_exact(4)
         length = int.from_bytes(length_bytes, "big")
+
+        # Validate response size
+        if length > self.MAX_MESSAGE_SIZE:
+            raise ValueError(f"Response too large: {length} bytes (max {self.MAX_MESSAGE_SIZE})")
+
         response_data = self._recv_exact(length)
-        
+
         return json.loads(response_data.decode())
-    
+
     def _recv_exact(self, n: int) -> bytes:
         """Receive exactly n bytes."""
         data = b""
@@ -99,8 +143,8 @@ class VsockClient:
                 raise ConnectionError("Connection closed")
             data += chunk
         return data
-    
-    def exec_command(self, command: str, timeout: int = 300, 
+
+    def exec_command(self, command: str, timeout: int = 300,
                      working_dir: str = "/workspace") -> dict:
         """Execute a command in the guest."""
         return self._send_request({
@@ -109,14 +153,14 @@ class VsockClient:
             "timeout": timeout,
             "working_dir": working_dir
         }, timeout=timeout + 5)
-    
+
     def read_file(self, path: str) -> dict:
         """Read a file from the guest."""
         return self._send_request({
             "action": "read_file",
             "path": path
         })
-    
+
     def write_file(self, path: str, content: str, is_base64: bool = False) -> dict:
         """Write a file to the guest."""
         return self._send_request({
@@ -125,7 +169,7 @@ class VsockClient:
             "content": content,
             "is_base64": is_base64
         })
-    
+
     def list_files(self, path: str = "/workspace") -> dict:
         """List files in a directory."""
         return self._send_request({
@@ -136,29 +180,29 @@ class VsockClient:
 
 class SandboxManager:
     """Manages Firecracker sandbox lifecycle."""
-    
+
     BASE_DIR = Path("/var/lib/firecracker-workspaces")
     KERNELS_DIR = BASE_DIR / "kernels"
     ROOTFS_DIR = BASE_DIR / "rootfs"
     SANDBOXES_DIR = BASE_DIR / "sandboxes"
     SNAPSHOTS_DIR = BASE_DIR / "snapshots"
-    
+
     FIRECRACKER_BIN = "/usr/bin/firecracker"
     JAILER_BIN = "/usr/bin/jailer"
-    
+
     def __init__(self):
         self._ensure_directories()
         self._active_sandboxes: Dict[str, SandboxConfig] = {}
         self._vsock_clients: Dict[str, VsockClient] = {}
         self._next_vsock_cid = 3  # CID 0, 1, 2 are reserved
         self._load_existing_sandboxes()
-    
+
     def _ensure_directories(self):
         """Create required directories if they don't exist."""
-        for dir_path in [self.KERNELS_DIR, self.ROOTFS_DIR, 
+        for dir_path in [self.KERNELS_DIR, self.ROOTFS_DIR,
                          self.SANDBOXES_DIR, self.SNAPSHOTS_DIR]:
             dir_path.mkdir(parents=True, exist_ok=True)
-    
+
     def _load_existing_sandboxes(self):
         """Load state of existing sandboxes from disk."""
         for sandbox_dir in self.SANDBOXES_DIR.iterdir():
@@ -176,54 +220,59 @@ class SandboxManager:
                             self._next_vsock_cid = config.vsock_cid + 1
                     except Exception as e:
                         logger.warning(f"Failed to load sandbox state from {state_file}: {e}")
-    
+
     def _get_sandbox_dir(self, sandbox_id: str) -> Path:
         return self.SANDBOXES_DIR / sandbox_id
-    
+
     def _get_socket_path(self, sandbox_id: str) -> Path:
         return self._get_sandbox_dir(sandbox_id) / "firecracker.sock"
-    
+
     def _get_vsock_path(self, sandbox_id: str) -> Path:
         return self._get_sandbox_dir(sandbox_id) / "vsock.sock"
-    
+
     def _get_kernel_path(self, template: str = "default") -> Path:
         return self.KERNELS_DIR / f"{template}-vmlinux.bin"
-    
+
     def _get_base_rootfs_path(self, template: str = "default") -> Path:
         return self.ROOTFS_DIR / f"{template}-rootfs.ext4"
-    
+
     def _create_overlay_rootfs(self, sandbox_id: str, template: str) -> Path:
         """Create a copy-on-write overlay of the base rootfs."""
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        
+
         base_rootfs = self._get_base_rootfs_path(template)
         if not base_rootfs.exists():
             raise FileNotFoundError(f"Base rootfs not found: {base_rootfs}")
-        
+
         overlay_rootfs = sandbox_dir / "rootfs.ext4"
-        
+
         # Create a sparse copy (copy-on-write via reflink if supported)
         subprocess.run([
             "cp", "--reflink=auto", "--sparse=always",
             str(base_rootfs), str(overlay_rootfs)
         ], check=True)
-        
+
         return overlay_rootfs
-    
+
     def _allocate_vsock_cid(self) -> int:
         """Allocate a unique vsock CID for the sandbox."""
         cid = self._next_vsock_cid
         self._next_vsock_cid += 1
         return cid
-    
-    def _call_firecracker_api(self, sandbox_id: str, method: str, 
+
+    def _call_firecracker_api(self, sandbox_id: str, method: str,
                                endpoint: str, data: dict = None) -> dict:
-        """Call the Firecracker API via unix socket using curl."""
+        """Call the Firecracker API via unix socket using curl.
+
+        Uses --fail-with-body to ensure HTTP errors are properly detected
+        while still capturing the response body for error messages.
+        """
         socket_path = self._get_socket_path(sandbox_id)
-        
-        cmd = ["curl", "-s", "--unix-socket", str(socket_path)]
-        
+
+        # Use --fail-with-body to detect HTTP errors (4xx, 5xx) while keeping response body
+        cmd = ["curl", "-s", "--fail-with-body", "--unix-socket", str(socket_path)]
+
         if method == "PUT":
             cmd.extend(["-X", "PUT"])
             if data:
@@ -236,50 +285,58 @@ class SandboxManager:
             if data:
                 cmd.extend(["-H", "Content-Type: application/json"])
                 cmd.extend(["-d", json.dumps(data)])
-        
+
         cmd.append(f"http://localhost{endpoint}")
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
-            raise Exception(f"Firecracker API error: {result.stderr}")
-        
+            # Try to parse error response for better error messages
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            try:
+                error_data = json.loads(result.stdout)
+                if "fault_message" in error_data:
+                    error_msg = error_data["fault_message"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            raise Exception(f"Firecracker API error on {endpoint}: {error_msg}")
+
         if result.stdout:
             try:
                 return json.loads(result.stdout)
             except json.JSONDecodeError:
                 return {}
         return {}
-    
-    async def create_sandbox(self, template: str, memory_mb: int, 
+
+    async def create_sandbox(self, template: str, memory_mb: int,
                             vcpu_count: int, workspace_id: Optional[str] = None) -> SandboxConfig:
         """Create and start a new sandbox."""
         sandbox_id = str(uuid.uuid4())[:8]
         workspace_id = workspace_id or sandbox_id
-        
+
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         socket_path = self._get_socket_path(sandbox_id)
         vsock_path = self._get_vsock_path(sandbox_id)
-        
+
         # Verify kernel exists
         kernel_path = self._get_kernel_path(template)
         if not kernel_path.exists():
             raise FileNotFoundError(f"Kernel not found: {kernel_path}")
-        
+
         # Create overlay rootfs
         rootfs_path = self._create_overlay_rootfs(sandbox_id, template)
-        
+
         # Create workspace directory
         workspace_dir = sandbox_dir / "workspace"
         workspace_dir.mkdir(exist_ok=True)
-        
+
         # Allocate vsock CID for guest communication
         vsock_cid = self._allocate_vsock_cid()
-        
+
         # Remove old socket if exists
         if socket_path.exists():
             socket_path.unlink()
-        
+
         # Start Firecracker process
         firecracker_proc = subprocess.Popen(
             [self.FIRECRACKER_BIN, "--api-sock", str(socket_path)],
@@ -287,7 +344,7 @@ class SandboxManager:
             stderr=subprocess.PIPE,
             cwd=str(sandbox_dir)
         )
-        
+
         # Wait for socket to be ready
         for _ in range(50):  # 5 second timeout
             if socket_path.exists():
@@ -296,7 +353,7 @@ class SandboxManager:
         else:
             firecracker_proc.kill()
             raise Exception("Firecracker socket not ready after 5 seconds")
-        
+
         try:
             # Configure the VM via API
             # 1. Set machine config
@@ -305,13 +362,13 @@ class SandboxManager:
                 "mem_size_mib": memory_mb,
                 "smt": False
             })
-            
+
             # 2. Set boot source
             self._call_firecracker_api(sandbox_id, "PUT", "/boot-source", {
                 "kernel_image_path": str(kernel_path),
                 "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
             })
-            
+
             # 3. Set root drive
             self._call_firecracker_api(sandbox_id, "PUT", "/drives/rootfs", {
                 "drive_id": "rootfs",
@@ -319,24 +376,24 @@ class SandboxManager:
                 "is_root_device": True,
                 "is_read_only": False
             })
-            
+
             # 4. Set vsock device for host-guest communication
             self._call_firecracker_api(sandbox_id, "PUT", "/vsock", {
                 "vsock_id": "vsock0",
                 "guest_cid": vsock_cid,
                 "uds_path": str(vsock_path)
             })
-            
+
             # 5. Start the VM
             self._call_firecracker_api(sandbox_id, "PUT", "/actions", {
                 "action_type": "InstanceStart"
             })
-            
+
         except Exception as e:
             firecracker_proc.kill()
             shutil.rmtree(sandbox_dir, ignore_errors=True)
             raise Exception(f"Failed to configure VM: {e}")
-        
+
         config = SandboxConfig(
             sandbox_id=sandbox_id,
             template=template,
@@ -348,106 +405,106 @@ class SandboxManager:
             vsock_cid=vsock_cid,
             firecracker_pid=firecracker_proc.pid
         )
-        
+
         # Save state
         state_file = sandbox_dir / "state.json"
         state_file.write_text(json.dumps(asdict(config)))
-        
+
         self._active_sandboxes[sandbox_id] = config
-        
-        # Create vsock client
-        client = VsockClient(vsock_cid)
+
+        # Create vsock client using the vsock UDS path
+        client = VsockClient(str(vsock_path))
         self._vsock_clients[sandbox_id] = client
-        
+
         # Wait for guest agent to be ready
         try:
             client.connect(timeout=30.0)
         except Exception as e:
             logger.warning(f"Guest agent not ready: {e}")
-        
+
         return config
-    
+
     async def destroy_sandbox(self, sandbox_id: str):
         """Stop and clean up a sandbox."""
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         config = self._active_sandboxes.get(sandbox_id)
-        
+
         # Disconnect vsock client
         if sandbox_id in self._vsock_clients:
             self._vsock_clients[sandbox_id].disconnect()
             del self._vsock_clients[sandbox_id]
-        
+
         # Send shutdown action
         try:
             self._call_firecracker_api(sandbox_id, "PUT", "/actions", {
                 "action_type": "SendCtrlAltDel"
             })
             await asyncio.sleep(1)
-        except:
+        except Exception:
             pass
-        
+
         # Kill firecracker process if still running
         if config and config.firecracker_pid:
             try:
                 os.kill(config.firecracker_pid, 9)
             except ProcessLookupError:
                 pass
-        
+
         # Clean up files
         if sandbox_dir.exists():
             shutil.rmtree(sandbox_dir)
-        
+
         if sandbox_id in self._active_sandboxes:
             del self._active_sandboxes[sandbox_id]
-    
+
     async def pause_sandbox(self, sandbox_id: str):
         """Pause a sandbox by creating a snapshot."""
         config = self._active_sandboxes.get(sandbox_id)
         if not config:
             raise ValueError(f"Sandbox not found: {sandbox_id}")
-        
+
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         snapshot_dir = self.SNAPSHOTS_DIR / sandbox_id
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Pause the VM first
         self._call_firecracker_api(sandbox_id, "PATCH", "/vm", {
             "state": "Paused"
         })
-        
+
         # Create snapshot via Firecracker API
         self._call_firecracker_api(sandbox_id, "PUT", "/snapshot/create", {
             "snapshot_type": "Full",
             "snapshot_path": str(snapshot_dir / "snapshot"),
             "mem_file_path": str(snapshot_dir / "memory")
         })
-        
+
         # Update state
         config.status = "paused"
         state_file = sandbox_dir / "state.json"
         state_file.write_text(json.dumps(asdict(config)))
-        
+
         # Disconnect vsock client
         if sandbox_id in self._vsock_clients:
             self._vsock_clients[sandbox_id].disconnect()
-    
+
     async def resume_sandbox(self, sandbox_id: str) -> SandboxConfig:
         """Resume a paused sandbox from snapshot."""
         config = self._active_sandboxes.get(sandbox_id)
         if not config:
             raise ValueError(f"Sandbox not found: {sandbox_id}")
-        
+
         snapshot_dir = self.SNAPSHOTS_DIR / sandbox_id
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         socket_path = self._get_socket_path(sandbox_id)
-        
+
         if not snapshot_dir.exists():
             raise FileNotFoundError(f"Snapshot not found for sandbox: {sandbox_id}")
-        
+
         # Remove old socket if exists
         if socket_path.exists():
             socket_path.unlink()
-        
+
         # Start new Firecracker process
         firecracker_proc = subprocess.Popen(
             [self.FIRECRACKER_BIN, "--api-sock", str(socket_path)],
@@ -455,7 +512,7 @@ class SandboxManager:
             stderr=subprocess.PIPE,
             cwd=str(sandbox_dir)
         )
-        
+
         # Wait for socket
         for _ in range(50):
             if socket_path.exists():
@@ -464,7 +521,7 @@ class SandboxManager:
         else:
             firecracker_proc.kill()
             raise Exception("Firecracker socket not ready")
-        
+
         # Load snapshot
         self._call_firecracker_api(sandbox_id, "PUT", "/snapshot/load", {
             "snapshot_path": str(snapshot_dir / "snapshot"),
@@ -475,52 +532,53 @@ class SandboxManager:
             "enable_diff_snapshots": False,
             "resume_vm": True
         })
-        
+
         # Update state
         config.status = "running"
         config.firecracker_pid = firecracker_proc.pid
         state_file = sandbox_dir / "state.json"
         state_file.write_text(json.dumps(asdict(config)))
-        
-        # Reconnect vsock client
-        if config.vsock_cid:
-            client = VsockClient(config.vsock_cid)
-            self._vsock_clients[sandbox_id] = client
-            try:
-                client.connect(timeout=10.0)
-            except Exception as e:
-                logger.warning(f"Failed to reconnect to guest agent: {e}")
-        
+
+        # Reconnect vsock client using the vsock UDS path
+        vsock_path = self._get_vsock_path(sandbox_id)
+        client = VsockClient(str(vsock_path))
+        self._vsock_clients[sandbox_id] = client
+        try:
+            client.connect(timeout=10.0)
+        except Exception as e:
+            logger.warning(f"Failed to reconnect to guest agent: {e}")
+
         return config
-    
+
     def _get_vsock_client(self, sandbox_id: str) -> VsockClient:
         """Get or create vsock client for a sandbox."""
         if sandbox_id not in self._vsock_clients:
             config = self._active_sandboxes.get(sandbox_id)
-            if not config or not config.vsock_cid:
-                raise ValueError(f"Sandbox not found or no vsock CID: {sandbox_id}")
-            client = VsockClient(config.vsock_cid)
+            if not config:
+                raise ValueError(f"Sandbox not found: {sandbox_id}")
+            vsock_path = self._get_vsock_path(sandbox_id)
+            client = VsockClient(str(vsock_path))
             client.connect()
             self._vsock_clients[sandbox_id] = client
         return self._vsock_clients[sandbox_id]
-    
-    async def exec_command(self, sandbox_id: str, command: str, 
+
+    async def exec_command(self, sandbox_id: str, command: str,
                           timeout: int = 300, working_dir: str = "/workspace") -> dict:
         """Execute a command in the sandbox."""
         client = self._get_vsock_client(sandbox_id)
         return client.exec_command(command, timeout, working_dir)
-    
+
     async def read_file(self, sandbox_id: str, path: str) -> dict:
         """Read a file from the sandbox."""
         client = self._get_vsock_client(sandbox_id)
         return client.read_file(path)
-    
-    async def write_file(self, sandbox_id: str, path: str, 
+
+    async def write_file(self, sandbox_id: str, path: str,
                         content: str, is_base64: bool = False) -> dict:
         """Write a file to the sandbox."""
         client = self._get_vsock_client(sandbox_id)
         return client.write_file(path, content, is_base64)
-    
+
     async def list_files(self, sandbox_id: str, path: str = "/workspace") -> dict:
         """List files in a directory."""
         client = self._get_vsock_client(sandbox_id)
