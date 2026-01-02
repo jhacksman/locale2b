@@ -12,6 +12,398 @@ This document outlines the development phases for locale2b, a self-hosted sandbo
 
 ---
 
+## CompyMac Integration Analysis
+
+This section documents the integration requirements between locale2b and CompyMac, identifying gaps and priorities based on CompyMac's existing execution model.
+
+### CompyMac's Existing Capabilities
+
+CompyMac's `LocalHarness` (in `src/compymac/local_harness.py`) already provides rich execution capabilities that run directly on the host machine:
+
+| Capability | CompyMac Implementation |
+|------------|------------------------|
+| Shell execution | `bash` tool with `subprocess.run()`, supports `exec_dir`, `bash_id`, `timeout`, `run_in_background` |
+| Background processes | PTY-based sessions with `bash_output` for polling, `write_to_shell` for input, `kill_shell` for termination |
+| File operations | `Read`, `Write`, `Edit` tools with truncation and envelope handling |
+| Search | `grep` (ripgrep-based), `glob` for file patterns |
+| Browser | Full Playwright integration: `browser_navigate`, `browser_view`, `browser_click`, `browser_type`, etc. |
+| Git operations | `git_view_pr`, `git_create_pr`, `git_pr_checks`, local git commands |
+| Web search | `web_search`, `web_get_contents` via Exa API |
+| LSP | `lsp_tool` for code intelligence |
+| Metacognition | `think` tool, temptation awareness, evidence-based gating |
+
+### locale2b's Value Proposition
+
+locale2b provides **isolation** that CompyMac's local execution cannot:
+
+1. **Security isolation** - Untrusted code runs in a VM and cannot escape to the host
+2. **Clean environments** - Fresh VM per task, no state pollution between runs
+3. **Resource isolation** - VM cannot consume all host resources
+4. **Reproducibility** - Identical environment for every execution
+
+### Tool Contract Compatibility Gap
+
+For CompyMac to use locale2b as an execution backend, locale2b must match CompyMac's harness tool contract. Current status:
+
+| CompyMac Tool | locale2b Status | Gap |
+|---------------|-----------------|-----|
+| `bash` (foreground) | Partial | Missing `bash_id` tracking, no streaming |
+| `bash` (background with `run_in_background=True`) | **Missing** | No background process support |
+| `bash_output` (poll background shell) | **Missing** | No streaming/polling |
+| `write_to_shell` (send input to process) | **Missing** | No interactive input |
+| `kill_shell` (terminate background process) | **Missing** | No process management |
+| `Read` / `Write` / file ops | Present | Via guest agent |
+| `grep` / `glob` | **Missing** | Could run via exec, but no native support |
+| Browser tools | N/A | Runs on host, not in VM |
+
+### Critical Gaps (Blocking Integration)
+
+#### 1. Process Model Parity (HIGHEST PRIORITY)
+
+CompyMac's execution model relies on:
+- **Background shell sessions** keyed by `bash_id`
+- **Streaming/polling output** via `bash_output`
+- **Interactive input** via `write_to_shell`
+- **Process lifecycle management** via `kill_shell`
+
+locale2b's current guest agent uses `subprocess.run(..., capture_output=True)` which:
+- Blocks until command completes
+- Cannot stream output incrementally
+- Cannot accept input after start
+- Cannot be cancelled mid-execution
+
+**Required Changes:**
+- Guest agent must support PTY-based execution
+- New action types: `exec_start`, `exec_poll`, `exec_input`, `exec_kill`
+- Session tracking by `bash_id` in guest agent
+- WebSocket or long-polling for streaming output to host
+
+#### 2. Controlled Networking (BLOCKING for real tasks)
+
+CompyMac locally has full network access for:
+- Package installation (`pip install`, `npm install`, `apt-get`)
+- Repository cloning (`git clone`)
+- API calls during tests
+
+locale2b currently has **no network access** (Firecracker default). This makes the VM unusable for most real development tasks.
+
+**Required Changes:**
+- Configure Firecracker tap device for network
+- Implement egress allowlist (apt/pip/npm registries, git hosts)
+- DNS controls and optional transparent proxy
+- Network policy configuration per sandbox
+
+#### 3. Environment Templates + Fast Start
+
+CompyMac's local harness runs in whatever environment exists on the host. locale2b needs:
+- **Pre-built templates** (Python, Node.js, Go, Rust toolchains)
+- **Package caches** (pip, npm) baked into templates
+- **Warm pool** or fork-from-snapshot for <2s sandbox creation
+- **Template versioning** and registry
+
+Without this, every task wastes time bootstrapping the environment.
+
+### Secondary Gaps (Important but not blocking)
+
+#### 4. Observability for Trace Integration
+
+CompyMac has sophisticated tracing (`TraceStore`, `TraceContext`, evidence-based gating). locale2b should expose:
+- Structured events (command start/stop, exit codes)
+- Streaming output chunks with timestamps
+- Resource usage snapshots (CPU, memory, disk)
+- Stable workspace ID for trace correlation across pause/resume
+
+#### 5. TTL and Cleanup Policies
+
+- Per-sandbox TTL (time-to-live)
+- Idle timeout for unused sandboxes
+- Automatic cleanup on expiration
+- Per-tenant quotas (future)
+
+### Architecture Decision: Integration Approach
+
+Two options for CompyMac integration:
+
+**Option A: New Harness Implementation**
+- Create `RemoteHarness` or `FirecrackerHarness` in CompyMac
+- Implements same tool interface as `LocalHarness`
+- Translates tool calls to locale2b REST API
+- Handles streaming via WebSocket
+
+**Option B: Adapter in locale2b**
+- Keep `compymac_integration/workspace_provider.py`
+- Expose CompyMac-compatible tool names directly
+- locale2b REST API mirrors CompyMac tool schemas
+
+**Recommendation:** Option A (new harness in CompyMac) is cleaner separation of concerns. locale2b provides a general-purpose sandbox API; CompyMac adapts it to its tool contract.
+
+### Revised Phase Priorities
+
+Based on this analysis, the implementation priority should be:
+
+1. **Phase 4.1 (NEW):** Process Model Parity - Background shells, streaming, interactive input
+2. **Phase 8.1 (NEW):** Controlled Networking - Egress allowlist, DNS controls
+3. **Phase 2.1 (NEW):** Template Pipeline - Pre-built images, warm pool, fast start
+4. **Phase 7.1 (NEW):** Observability - Structured events, trace integration
+5. **Phase 9:** CompyMac Integration - RemoteHarness implementation
+
+### What locale2b Does NOT Need
+
+Given CompyMac's existing capabilities:
+- **Browser in VM** - Not needed unless full "computer use" isolation is required. Browser can remain on host.
+- **LSP in VM** - Can run via exec if needed
+- **Web search** - Handled by CompyMac directly
+
+---
+
+## Implementation Status
+
+### Completed Phases
+- [x] Phase 1: Requirements & Interface Design (API contracts defined)
+- [x] Phase 2: Host Environment & Artifacts (scripts exist, need KVM testing)
+- [x] Phase 3: Core MicroVM Lifecycle (create/destroy implemented)
+- [x] Phase 4: Host-Guest Communication (vsock + guest agent working)
+- [x] Phase 5: REST API Surface (FastAPI with all endpoints)
+- [x] Phase 6: Persistence & Pause/Resume (snapshots implemented)
+- [x] Phase 7: Resource Governance (capacity tracking, env config)
+- [x] Phase 8: Security Hardening (API auth, rate limiting, path traversal protection)
+
+### Remaining Work
+- [ ] Phase 4.1: Process Model Parity (background shells, streaming)
+- [ ] Phase 8.1: Controlled Networking (egress allowlist)
+- [ ] Phase 2.1: Template Pipeline (pre-built images, warm pool)
+- [ ] Phase 7.1: Observability (structured events, trace integration)
+- [ ] Phase 9: CompyMac Integration (RemoteHarness)
+
+### Critical Blocker
+All code is written but **untested on actual KVM hardware**. The vsock communication model was fixed based on Firecracker docs but needs real-world validation on the Intel NUC.
+
+---
+
+## Phase 4.1: Process Model Parity (NEW - HIGHEST PRIORITY)
+
+**Duration:** 2-3 weeks  
+**Goal:** Enable background shell sessions with streaming output and interactive input to match CompyMac's execution model.
+
+### Deliverables
+
+1. **Guest Agent PTY Support** (`guest_agent/agent.py`)
+   - Replace `subprocess.run()` with PTY-based execution
+   - New action types:
+     - `exec_start`: Start a command, return session_id immediately
+     - `exec_poll`: Get new output from a running session
+     - `exec_input`: Send input to a running session
+     - `exec_kill`: Terminate a running session
+     - `exec_status`: Get session status (running/exited/exit_code)
+   - Session tracking by `bash_id` (maps to CompyMac's `bash_id`)
+   - Output buffering with configurable max size
+   - Graceful cleanup of orphaned sessions
+
+2. **Host-Side Streaming** (`workspace_service/sandbox_manager.py`)
+   - New methods:
+     - `start_command()`: Start background command, return session_id
+     - `poll_output()`: Get buffered output from session
+     - `send_input()`: Send input to session
+     - `kill_session()`: Terminate session
+   - Connection multiplexing for concurrent sessions
+   - Timeout handling for long-running processes
+
+3. **REST API Extensions** (`workspace_service/main.py`)
+   - New endpoints:
+     - `POST /sandboxes/{id}/exec/start` - Start background command
+     - `GET /sandboxes/{id}/exec/{session_id}/output` - Poll output
+     - `POST /sandboxes/{id}/exec/{session_id}/input` - Send input
+     - `DELETE /sandboxes/{id}/exec/{session_id}` - Kill session
+     - `GET /sandboxes/{id}/exec/{session_id}/status` - Get status
+   - Optional: WebSocket endpoint for real-time streaming
+
+4. **Backward Compatibility**
+   - Keep existing `POST /sandboxes/{id}/exec` for simple blocking execution
+   - Add `background: true` parameter to use new streaming mode
+
+### Testing
+- Start long-running command, poll output incrementally
+- Send input to interactive process (e.g., Python REPL)
+- Kill running process, verify cleanup
+- Multiple concurrent sessions per sandbox
+- Session cleanup on sandbox destroy
+
+### Exit Criteria
+- CompyMac's `bash`, `bash_output`, `write_to_shell`, `kill_shell` patterns work via locale2b
+- No output loss during streaming
+- Proper cleanup on all termination paths
+
+---
+
+## Phase 8.1: Controlled Networking (NEW - BLOCKING)
+
+**Duration:** 2-3 weeks  
+**Goal:** Enable network access with security controls for package installation and git operations.
+
+### Deliverables
+
+1. **Firecracker Network Configuration**
+   - Configure tap device for VM network
+   - NAT setup on host for outbound traffic
+   - DHCP or static IP assignment in guest
+   - DNS configuration in guest
+
+2. **Egress Allowlist**
+   - Configurable allowlist of permitted destinations:
+     - Package registries: `pypi.org`, `registry.npmjs.org`, `dl-cdn.alpinelinux.org`
+     - Git hosts: `github.com`, `gitlab.com`, `bitbucket.org`
+     - Custom allowlist via environment variable
+   - iptables rules on host to enforce allowlist
+   - Default deny for non-allowlisted destinations
+
+3. **DNS Controls**
+   - DNS server configuration in guest
+   - Optional: DNS-based allowlist enforcement
+   - Logging of DNS queries for audit
+
+4. **Network Policy Configuration**
+   - Per-sandbox network policy:
+     - `none`: No network (current default)
+     - `allowlist`: Egress to allowlisted destinations only
+     - `full`: Full network access (for trusted workloads)
+   - API parameter: `network_policy` in create_sandbox
+
+5. **Optional: Transparent Proxy**
+   - HTTP/HTTPS proxy for logging and inspection
+   - Certificate injection for HTTPS inspection
+   - Request/response logging for audit
+
+### Testing
+- `pip install requests` works with allowlist policy
+- `git clone` from GitHub works
+- Arbitrary outbound connections blocked
+- DNS resolution works for allowed domains
+- Network policy enforcement per sandbox
+
+### Exit Criteria
+- Package installation and git clone work reliably
+- Unauthorized egress blocked
+- Network policy configurable per sandbox
+
+---
+
+## Phase 2.1: Template Pipeline (NEW)
+
+**Duration:** 2-3 weeks  
+**Goal:** Pre-built environment templates with fast sandbox creation.
+
+### Deliverables
+
+1. **Template Registry**
+   - Template manifest format (JSON):
+     ```json
+     {
+       "name": "python-3.11",
+       "version": "1.0.0",
+       "base": "alpine-3.18",
+       "packages": ["python3", "pip", "git", "curl"],
+       "pip_packages": ["pytest", "requests"],
+       "rootfs_sha256": "...",
+       "created_at": "..."
+     }
+     ```
+   - Template storage in `/var/lib/firecracker-workspaces/templates/`
+   - Template listing and selection via API
+
+2. **Pre-built Templates**
+   - `default`: Alpine + Python 3.11 + common tools
+   - `python-ml`: Default + numpy, pandas, scikit-learn
+   - `nodejs-18`: Alpine + Node.js 18 + npm
+   - `golang-1.21`: Alpine + Go 1.21
+   - `rust-1.75`: Alpine + Rust toolchain
+
+3. **Template Build Pipeline**
+   - Script to build template from manifest
+   - Package cache baking (pip, npm)
+   - Reproducible builds with checksums
+   - CI integration for template updates
+
+4. **Fast Start via Warm Pool**
+   - Pre-booted VMs waiting for assignment
+   - Configurable pool size per template
+   - Pool replenishment on sandbox destroy
+   - Target: <2s sandbox creation from warm pool
+
+5. **Fork-from-Snapshot Alternative**
+   - Boot template once, snapshot immediately
+   - New sandboxes fork from snapshot
+   - Faster than warm pool, less memory overhead
+
+### Testing
+- Create sandbox with specific template
+- Verify pre-installed packages available
+- Warm pool reduces creation time to <2s
+- Template versioning and updates work
+
+### Exit Criteria
+- Multiple templates available
+- Sandbox creation <2s from warm pool
+- Template build pipeline automated
+
+---
+
+## Phase 7.1: Observability (NEW)
+
+**Duration:** 1-2 weeks  
+**Goal:** Structured telemetry for CompyMac trace integration.
+
+### Deliverables
+
+1. **Structured Event Logging**
+   - Event types:
+     - `sandbox.created`, `sandbox.destroyed`
+     - `exec.started`, `exec.completed`, `exec.failed`
+     - `file.read`, `file.written`
+     - `network.request` (if networking enabled)
+   - Event format (JSON):
+     ```json
+     {
+       "event_type": "exec.completed",
+       "sandbox_id": "...",
+       "session_id": "...",
+       "timestamp": "...",
+       "duration_ms": 1234,
+       "exit_code": 0,
+       "command": "pytest tests/"
+     }
+     ```
+
+2. **Event Streaming**
+   - WebSocket endpoint for real-time events
+   - Event filtering by sandbox_id, event_type
+   - Backpressure handling
+
+3. **Resource Metrics**
+   - Per-sandbox metrics:
+     - CPU usage (from cgroups)
+     - Memory usage
+     - Disk I/O
+     - Network I/O (if enabled)
+   - Metrics endpoint: `GET /sandboxes/{id}/metrics`
+
+4. **Audit Log**
+   - Persistent log of all operations
+   - Configurable retention
+   - Export format for analysis
+
+### Testing
+- Events emitted for all operations
+- WebSocket streaming works
+- Metrics accurate vs actual resource usage
+- Audit log captures all operations
+
+### Exit Criteria
+- CompyMac can integrate locale2b events into TraceStore
+- Resource metrics available for capacity planning
+- Audit trail for security review
+
+---
+
 ## Phase 1: Requirements, Constraints, and Interface Design
 
 **Duration:** 1-2 weeks  
@@ -461,55 +853,63 @@ This document outlines the development phases for locale2b, a self-hosted sandbo
 ## Phase 9: CompyMac Integration and Developer Experience
 
 **Duration:** 2-3 weeks  
-**Goal:** Integrate with CompyMac agent and provide excellent developer experience.
+**Goal:** Integrate with CompyMac agent via a new RemoteHarness implementation.
+
+**Prerequisites:** Phase 4.1 (Process Model Parity) must be complete for full integration.
 
 ### Deliverables
 
-1. **CompyMac Provider** (`compymac_integration/workspace_provider.py`)
-   - FirecrackerWorkspaceProvider class
-   - Async context manager support
-   - All workspace operations:
-     - create_workspace()
-     - run_command()
-     - write_file() / read_file()
-     - list_files()
-     - pause_workspace() / resume_workspace()
-     - destroy_workspace()
-   - Convenience methods:
-     - install_package()
-     - clone_repo()
-     - run_python()
-     - run_tests()
+1. **RemoteHarness Implementation** (in CompyMac repo: `src/compymac/remote_harness.py`)
+   - Implements same interface as `LocalHarness`
+   - Translates CompyMac tool calls to locale2b REST API:
+     - `bash` → `POST /sandboxes/{id}/exec/start` or `/exec`
+     - `bash_output` → `GET /sandboxes/{id}/exec/{session_id}/output`
+     - `write_to_shell` → `POST /sandboxes/{id}/exec/{session_id}/input`
+     - `kill_shell` → `DELETE /sandboxes/{id}/exec/{session_id}`
+     - `Read` → `GET /sandboxes/{id}/files/read`
+     - `Write` → `POST /sandboxes/{id}/files/write`
+   - WebSocket connection for streaming output
+   - Automatic sandbox lifecycle management
+   - Fallback to LocalHarness for browser/web tools
 
-2. **Integration Testing**
+2. **locale2b Client Library** (`compymac_integration/client.py`)
+   - Python client for locale2b REST API
+   - Async support with httpx
+   - Connection pooling and retry logic
+   - Streaming output via WebSocket or long-polling
+
+3. **Configuration**
+   - Environment variables for locale2b connection:
+     - `LOCALE2B_URL`: Service URL (default: `http://localhost:8080`)
+     - `LOCALE2B_API_KEY`: Authentication key
+     - `LOCALE2B_TEMPLATE`: Default template (default: `python-3.11`)
+   - Harness selection in CompyMac config:
+     - `COMPYMAC_HARNESS=local` (default)
+     - `COMPYMAC_HARNESS=remote` (use locale2b)
+
+4. **Integration Testing**
    - End-to-end tests with CompyMac agent loop
-   - Validate expected semantics match
-   - Test workspace persistence across agent runs
-   - Verify file sync behavior
+   - Tool parity tests: Same commands produce same results in local vs remote
+   - Performance comparison: Local vs remote execution overhead
+   - Error handling: Network failures, sandbox crashes
 
-3. **Developer Documentation**
-   - Quick start guide
-   - API reference
-   - Integration examples
-   - Troubleshooting guide
-
-4. **Example Applications**
-   - Simple "hello world" sandbox usage
-   - Python script execution example
-   - Git clone and build example
-   - Multi-step agent task example
+5. **Developer Documentation**
+   - Quick start guide for locale2b + CompyMac
+   - Architecture diagram showing integration
+   - Troubleshooting guide for common issues
+   - Performance tuning recommendations
 
 ### Testing
-- End-to-end: CompyMac -> Service -> Guest Agent
-- Regression tests for exact API calls CompyMac uses
-- Performance benchmarks
-- Error handling in agent context
+- Run SWE-bench task with RemoteHarness
+- Verify tool contract parity with LocalHarness
+- Stress test: Multiple concurrent agent sessions
+- Failover: Graceful handling of locale2b unavailability
 
 ### Exit Criteria
-- CompyMac integration working end-to-end
+- CompyMac can run tasks using locale2b as execution backend
+- Tool behavior matches LocalHarness semantics
 - Documentation complete
-- Examples tested and working
-- Performance meets requirements
+- Performance overhead <200ms per tool call
 
 ---
 
