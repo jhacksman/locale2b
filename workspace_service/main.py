@@ -5,19 +5,28 @@ This service provides a REST API for creating, managing, and destroying
 Firecracker microVM sandboxes for AI agent code execution.
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+import base64
+import logging
+import os
+from typing import List, Optional
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-import os
-import base64
 
+from .config import get_config
 from .sandbox_manager import SandboxManager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Firecracker Workspace Service",
     description="REST API for managing Firecracker microVM sandboxes",
-    version="1.0.0"
+    version="1.0.0",
 )
 
 # Add CORS middleware for web clients
@@ -35,11 +44,13 @@ sandbox_manager = SandboxManager()
 
 # Request/Response Models
 
+
 class CreateSandboxRequest(BaseModel):
     template: str = "default"
     memory_mb: int = 512
     vcpu_count: int = 1
     workspace_id: Optional[str] = None
+
 
 class SandboxResponse(BaseModel):
     sandbox_id: str
@@ -51,10 +62,12 @@ class SandboxResponse(BaseModel):
     created_at: str
     ip_address: Optional[str] = None
 
+
 class CommandRequest(BaseModel):
     command: str
     timeout_seconds: int = 300
     working_dir: str = "/workspace"
+
 
 class CommandResponse(BaseModel):
     success: bool
@@ -63,56 +76,111 @@ class CommandResponse(BaseModel):
     stderr: str
     error: Optional[str] = None
 
+
 class FileWriteRequest(BaseModel):
     path: str
     content: str
     is_base64: bool = False
+
 
 class FileReadResponse(BaseModel):
     success: bool
     content: Optional[str] = None
     error: Optional[str] = None
 
+
 class FileListEntry(BaseModel):
     name: str
     is_dir: bool
     size: int
+
 
 class FileListResponse(BaseModel):
     success: bool
     entries: Optional[List[FileListEntry]] = None
     error: Optional[str] = None
 
+
 class HealthResponse(BaseModel):
     status: str
     version: str
     active_sandboxes: int
+    max_sandboxes: int
+    memory_used_mb: int
+    memory_available_mb: int
+    memory_budget_mb: int
+
+
+class CapacityResponse(BaseModel):
+    active_sandboxes: int
+    max_sandboxes: int
+    memory_used_mb: int
+    memory_available_mb: int
+    memory_budget_mb: int
+    can_create_default: bool
+    default_memory_mb: int
+    default_vcpu_count: int
 
 
 # Health endpoint
 
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Check service health."""
+    """Check service health and capacity."""
+    capacity = sandbox_manager.get_capacity_info()
     return HealthResponse(
         status="healthy",
         version="1.0.0",
-        active_sandboxes=len(sandbox_manager._active_sandboxes)
+        active_sandboxes=capacity["active_sandboxes"],
+        max_sandboxes=capacity["max_sandboxes"],
+        memory_used_mb=capacity["memory_used_mb"],
+        memory_available_mb=capacity["memory_available_mb"],
+        memory_budget_mb=capacity["memory_budget_mb"],
+    )
+
+
+@app.get("/capacity", response_model=CapacityResponse)
+async def get_capacity():
+    """Get detailed capacity information."""
+    capacity = sandbox_manager.get_capacity_info()
+    config = get_config()
+    can_create, _ = sandbox_manager.can_create_sandbox(config.default_memory_mb)
+    return CapacityResponse(
+        active_sandboxes=capacity["active_sandboxes"],
+        max_sandboxes=capacity["max_sandboxes"],
+        memory_used_mb=capacity["memory_used_mb"],
+        memory_available_mb=capacity["memory_available_mb"],
+        memory_budget_mb=capacity["memory_budget_mb"],
+        can_create_default=can_create,
+        default_memory_mb=config.default_memory_mb,
+        default_vcpu_count=config.default_vcpu_count,
     )
 
 
 # Sandbox lifecycle endpoints
 
+
 @app.post("/sandboxes", response_model=SandboxResponse)
 async def create_sandbox(request: CreateSandboxRequest):
-    """Create a new sandbox or resume an existing workspace."""
+    """Create a new sandbox or resume an existing workspace.
+
+    Returns:
+        SandboxResponse with the new sandbox details
+
+    Raises:
+        400: Invalid request (memory/vcpu out of range)
+        503: Service at capacity (too many sandboxes or insufficient memory)
+        500: Internal server error
+    """
     try:
         config = await sandbox_manager.create_sandbox(
             template=request.template,
             memory_mb=request.memory_mb,
             vcpu_count=request.vcpu_count,
-            workspace_id=request.workspace_id
+            workspace_id=request.workspace_id,
         )
+        logger.info(f"Created sandbox {config.sandbox_id} with {config.memory_mb}MB RAM")
         return SandboxResponse(
             sandbox_id=config.sandbox_id,
             status=config.status,
@@ -121,9 +189,22 @@ async def create_sandbox(request: CreateSandboxRequest):
             vcpu_count=config.vcpu_count,
             workspace_id=config.workspace_id,
             created_at=config.created_at,
-            ip_address=config.ip_address
+            ip_address=config.ip_address,
         )
+    except ValueError as e:
+        error_msg = str(e)
+        # Distinguish between validation errors (400) and capacity errors (503)
+        if "Maximum sandbox limit" in error_msg or "Insufficient memory" in error_msg:
+            logger.warning(f"Capacity limit reached: {error_msg}")
+            raise HTTPException(status_code=503, detail=error_msg)
+        else:
+            logger.warning(f"Invalid request: {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+    except FileNotFoundError as e:
+        logger.error(f"Missing artifact: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        logger.error(f"Failed to create sandbox: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -132,16 +213,18 @@ async def list_sandboxes():
     """List all active sandboxes."""
     sandboxes = []
     for config in sandbox_manager._active_sandboxes.values():
-        sandboxes.append(SandboxResponse(
-            sandbox_id=config.sandbox_id,
-            status=config.status,
-            template=config.template,
-            memory_mb=config.memory_mb,
-            vcpu_count=config.vcpu_count,
-            workspace_id=config.workspace_id,
-            created_at=config.created_at,
-            ip_address=config.ip_address
-        ))
+        sandboxes.append(
+            SandboxResponse(
+                sandbox_id=config.sandbox_id,
+                status=config.status,
+                template=config.template,
+                memory_mb=config.memory_mb,
+                vcpu_count=config.vcpu_count,
+                workspace_id=config.workspace_id,
+                created_at=config.created_at,
+                ip_address=config.ip_address,
+            )
+        )
     return sandboxes
 
 
@@ -160,7 +243,7 @@ async def get_sandbox(sandbox_id: str):
         vcpu_count=config.vcpu_count,
         workspace_id=config.workspace_id,
         created_at=config.created_at,
-        ip_address=config.ip_address
+        ip_address=config.ip_address,
     )
 
 
@@ -203,13 +286,14 @@ async def resume_sandbox(sandbox_id: str):
             vcpu_count=config.vcpu_count,
             workspace_id=config.workspace_id,
             created_at=config.created_at,
-            ip_address=config.ip_address
+            ip_address=config.ip_address,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # Command execution endpoint
+
 
 @app.post("/sandboxes/{sandbox_id}/exec", response_model=CommandResponse)
 async def exec_command(sandbox_id: str, request: CommandRequest):
@@ -222,20 +306,21 @@ async def exec_command(sandbox_id: str, request: CommandRequest):
             sandbox_id=sandbox_id,
             command=request.command,
             timeout=request.timeout_seconds,
-            working_dir=request.working_dir
+            working_dir=request.working_dir,
         )
         return CommandResponse(
             success=result.get("success", False),
             exit_code=result.get("exit_code", -1),
             stdout=result.get("stdout", ""),
             stderr=result.get("stderr", ""),
-            error=result.get("error")
+            error=result.get("error"),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # File operation endpoints
+
 
 @app.post("/sandboxes/{sandbox_id}/files/write")
 async def write_file(sandbox_id: str, request: FileWriteRequest):
@@ -248,7 +333,7 @@ async def write_file(sandbox_id: str, request: FileWriteRequest):
             sandbox_id=sandbox_id,
             path=request.path,
             content=request.content,
-            is_base64=request.is_base64
+            is_base64=request.is_base64,
         )
         if result.get("success"):
             return {"status": "written", "path": request.path}
@@ -271,7 +356,7 @@ async def read_file(sandbox_id: str, path: str):
         return FileReadResponse(
             success=result.get("success", False),
             content=result.get("content"),
-            error=result.get("error")
+            error=result.get("error"),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -307,10 +392,7 @@ async def upload_file(sandbox_id: str, path: str, file: UploadFile = File(...)):
         content = await file.read()
         content_b64 = base64.b64encode(content).decode()
         result = await sandbox_manager.write_file(
-            sandbox_id=sandbox_id,
-            path=path,
-            content=content_b64,
-            is_base64=True
+            sandbox_id=sandbox_id, path=path, content=content_b64, is_base64=True
         )
         if result.get("success"):
             return {"status": "uploaded", "path": path, "size": len(content)}

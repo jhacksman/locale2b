@@ -5,19 +5,21 @@ This module manages the creation, destruction, pausing, and resuming of
 Firecracker microVMs, as well as communication with the guest agent.
 """
 
-import os
-import json
-import subprocess
-import socket
-import time
-import shutil
-import uuid
 import asyncio
-from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict
-from datetime import datetime
+import json
 import logging
+import os
+import shutil
+import socket
+import subprocess
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
+
+from .config import ServiceConfig, get_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SandboxConfig:
     """Configuration and state for a sandbox."""
+
     sandbox_id: str
     template: str
     memory_mb: int
@@ -144,63 +147,102 @@ class VsockClient:
             data += chunk
         return data
 
-    def exec_command(self, command: str, timeout: int = 300,
-                     working_dir: str = "/workspace") -> dict:
+    def exec_command(
+        self, command: str, timeout: int = 300, working_dir: str = "/workspace"
+    ) -> dict:
         """Execute a command in the guest."""
-        return self._send_request({
-            "action": "exec",
-            "command": command,
-            "timeout": timeout,
-            "working_dir": working_dir
-        }, timeout=timeout + 5)
+        return self._send_request(
+            {"action": "exec", "command": command, "timeout": timeout, "working_dir": working_dir},
+            timeout=timeout + 5,
+        )
 
     def read_file(self, path: str) -> dict:
         """Read a file from the guest."""
-        return self._send_request({
-            "action": "read_file",
-            "path": path
-        })
+        return self._send_request({"action": "read_file", "path": path})
 
     def write_file(self, path: str, content: str, is_base64: bool = False) -> dict:
         """Write a file to the guest."""
-        return self._send_request({
-            "action": "write_file",
-            "path": path,
-            "content": content,
-            "is_base64": is_base64
-        })
+        return self._send_request(
+            {"action": "write_file", "path": path, "content": content, "is_base64": is_base64}
+        )
 
     def list_files(self, path: str = "/workspace") -> dict:
         """List files in a directory."""
-        return self._send_request({
-            "action": "list_files",
-            "path": path
-        })
+        return self._send_request({"action": "list_files", "path": path})
 
 
 class SandboxManager:
-    """Manages Firecracker sandbox lifecycle."""
+    """Manages Firecracker sandbox lifecycle with capacity tracking."""
 
-    BASE_DIR = Path("/var/lib/firecracker-workspaces")
-    KERNELS_DIR = BASE_DIR / "kernels"
-    ROOTFS_DIR = BASE_DIR / "rootfs"
-    SANDBOXES_DIR = BASE_DIR / "sandboxes"
-    SNAPSHOTS_DIR = BASE_DIR / "snapshots"
+    def __init__(self, config: Optional[ServiceConfig] = None):
+        self.config = config or get_config()
 
-    FIRECRACKER_BIN = "/usr/bin/firecracker"
-    JAILER_BIN = "/usr/bin/jailer"
+        # Directory paths from config
+        self.BASE_DIR = self.config.base_dir
+        self.KERNELS_DIR = self.config.kernels_dir
+        self.ROOTFS_DIR = self.config.rootfs_dir
+        self.SANDBOXES_DIR = self.config.sandboxes_dir
+        self.SNAPSHOTS_DIR = self.config.snapshots_dir
 
-    def __init__(self):
+        # Binary paths from config
+        self.FIRECRACKER_BIN = self.config.firecracker_bin
+        self.JAILER_BIN = self.config.jailer_bin
+
         self._ensure_directories()
         self._active_sandboxes: Dict[str, SandboxConfig] = {}
         self._vsock_clients: Dict[str, VsockClient] = {}
         self._next_vsock_cid = 3  # CID 0, 1, 2 are reserved
         self._load_existing_sandboxes()
 
+    @property
+    def active_sandbox_count(self) -> int:
+        """Return the number of active sandboxes."""
+        return len(self._active_sandboxes)
+
+    @property
+    def memory_used_mb(self) -> int:
+        """Return total memory used by active sandboxes."""
+        return sum(s.memory_mb for s in self._active_sandboxes.values() if s.status == "running")
+
+    @property
+    def memory_available_mb(self) -> int:
+        """Return memory available for new sandboxes."""
+        return self.config.total_memory_budget_mb - self.memory_used_mb
+
+    def can_create_sandbox(self, memory_mb: int) -> tuple[bool, str]:
+        """Check if a new sandbox can be created with the given resources."""
+        # Check sandbox count limit
+        if self.active_sandbox_count >= self.config.max_sandboxes:
+            return False, f"Maximum sandbox limit reached ({self.config.max_sandboxes})"
+
+        # Check memory limit
+        if memory_mb > self.memory_available_mb:
+            return False, (
+                f"Insufficient memory: requested {memory_mb}MB, "
+                f"available {self.memory_available_mb}MB"
+            )
+
+        # Check per-sandbox memory limits
+        if memory_mb < self.config.min_memory_mb:
+            return False, (f"Memory too low: minimum is {self.config.min_memory_mb}MB")
+        if memory_mb > self.config.max_memory_mb:
+            return False, (f"Memory too high: maximum is {self.config.max_memory_mb}MB")
+
+        return True, ""
+
+    def get_capacity_info(self) -> dict:
+        """Return capacity information for the health endpoint."""
+        return {
+            "active_sandboxes": self.active_sandbox_count,
+            "max_sandboxes": self.config.max_sandboxes,
+            "memory_used_mb": self.memory_used_mb,
+            "memory_available_mb": self.memory_available_mb,
+            "memory_budget_mb": self.config.total_memory_budget_mb,
+        }
+
     def _ensure_directories(self):
         """Create required directories if they don't exist."""
-        for dir_path in [self.KERNELS_DIR, self.ROOTFS_DIR,
-                         self.SANDBOXES_DIR, self.SNAPSHOTS_DIR]:
+        for dir_path in [self.KERNELS_DIR, self.ROOTFS_DIR, self.SANDBOXES_DIR, self.SNAPSHOTS_DIR]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
     def _load_existing_sandboxes(self):
@@ -248,10 +290,10 @@ class SandboxManager:
         overlay_rootfs = sandbox_dir / "rootfs.ext4"
 
         # Create a sparse copy (copy-on-write via reflink if supported)
-        subprocess.run([
-            "cp", "--reflink=auto", "--sparse=always",
-            str(base_rootfs), str(overlay_rootfs)
-        ], check=True)
+        subprocess.run(
+            ["cp", "--reflink=auto", "--sparse=always", str(base_rootfs), str(overlay_rootfs)],
+            check=True,
+        )
 
         return overlay_rootfs
 
@@ -261,8 +303,9 @@ class SandboxManager:
         self._next_vsock_cid += 1
         return cid
 
-    def _call_firecracker_api(self, sandbox_id: str, method: str,
-                               endpoint: str, data: dict = None) -> dict:
+    def _call_firecracker_api(
+        self, sandbox_id: str, method: str, endpoint: str, data: dict = None
+    ) -> dict:
         """Call the Firecracker API via unix socket using curl.
 
         Uses --fail-with-body to ensure HTTP errors are properly detected
@@ -308,9 +351,43 @@ class SandboxManager:
                 return {}
         return {}
 
-    async def create_sandbox(self, template: str, memory_mb: int,
-                            vcpu_count: int, workspace_id: Optional[str] = None) -> SandboxConfig:
-        """Create and start a new sandbox."""
+    async def create_sandbox(
+        self,
+        template: str = "default",
+        memory_mb: Optional[int] = None,
+        vcpu_count: Optional[int] = None,
+        workspace_id: Optional[str] = None,
+    ) -> SandboxConfig:
+        """Create and start a new sandbox.
+
+        Args:
+            template: The rootfs template to use (default: "default")
+            memory_mb: Memory allocation in MB (default from config)
+            vcpu_count: Number of vCPUs (default from config)
+            workspace_id: Optional workspace ID for persistence
+
+        Returns:
+            SandboxConfig with the new sandbox details
+
+        Raises:
+            ValueError: If resource limits are exceeded
+            FileNotFoundError: If kernel or rootfs not found
+        """
+        # Apply defaults from config
+        memory_mb = memory_mb or self.config.default_memory_mb
+        vcpu_count = vcpu_count or self.config.default_vcpu_count
+
+        # Validate vCPU count
+        if vcpu_count < self.config.min_vcpu_count:
+            raise ValueError(f"vCPU count too low: minimum is {self.config.min_vcpu_count}")
+        if vcpu_count > self.config.max_vcpu_count:
+            raise ValueError(f"vCPU count too high: maximum is {self.config.max_vcpu_count}")
+
+        # Check capacity before creating
+        can_create, reason = self.can_create_sandbox(memory_mb)
+        if not can_create:
+            raise ValueError(reason)
+
         sandbox_id = str(uuid.uuid4())[:8]
         workspace_id = workspace_id or sandbox_id
 
@@ -342,7 +419,7 @@ class SandboxManager:
             [self.FIRECRACKER_BIN, "--api-sock", str(socket_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=str(sandbox_dir)
+            cwd=str(sandbox_dir),
         )
 
         # Wait for socket to be ready
@@ -357,37 +434,49 @@ class SandboxManager:
         try:
             # Configure the VM via API
             # 1. Set machine config
-            self._call_firecracker_api(sandbox_id, "PUT", "/machine-config", {
-                "vcpu_count": vcpu_count,
-                "mem_size_mib": memory_mb,
-                "smt": False
-            })
+            self._call_firecracker_api(
+                sandbox_id,
+                "PUT",
+                "/machine-config",
+                {"vcpu_count": vcpu_count, "mem_size_mib": memory_mb, "smt": False},
+            )
 
             # 2. Set boot source
-            self._call_firecracker_api(sandbox_id, "PUT", "/boot-source", {
-                "kernel_image_path": str(kernel_path),
-                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"
-            })
+            self._call_firecracker_api(
+                sandbox_id,
+                "PUT",
+                "/boot-source",
+                {
+                    "kernel_image_path": str(kernel_path),
+                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init",
+                },
+            )
 
             # 3. Set root drive
-            self._call_firecracker_api(sandbox_id, "PUT", "/drives/rootfs", {
-                "drive_id": "rootfs",
-                "path_on_host": str(rootfs_path),
-                "is_root_device": True,
-                "is_read_only": False
-            })
+            self._call_firecracker_api(
+                sandbox_id,
+                "PUT",
+                "/drives/rootfs",
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": str(rootfs_path),
+                    "is_root_device": True,
+                    "is_read_only": False,
+                },
+            )
 
             # 4. Set vsock device for host-guest communication
-            self._call_firecracker_api(sandbox_id, "PUT", "/vsock", {
-                "vsock_id": "vsock0",
-                "guest_cid": vsock_cid,
-                "uds_path": str(vsock_path)
-            })
+            self._call_firecracker_api(
+                sandbox_id,
+                "PUT",
+                "/vsock",
+                {"vsock_id": "vsock0", "guest_cid": vsock_cid, "uds_path": str(vsock_path)},
+            )
 
             # 5. Start the VM
-            self._call_firecracker_api(sandbox_id, "PUT", "/actions", {
-                "action_type": "InstanceStart"
-            })
+            self._call_firecracker_api(
+                sandbox_id, "PUT", "/actions", {"action_type": "InstanceStart"}
+            )
 
         except Exception as e:
             firecracker_proc.kill()
@@ -403,7 +492,7 @@ class SandboxManager:
             status="running",
             created_at=datetime.utcnow().isoformat(),
             vsock_cid=vsock_cid,
-            firecracker_pid=firecracker_proc.pid
+            firecracker_pid=firecracker_proc.pid,
         )
 
         # Save state
@@ -436,9 +525,9 @@ class SandboxManager:
 
         # Send shutdown action
         try:
-            self._call_firecracker_api(sandbox_id, "PUT", "/actions", {
-                "action_type": "SendCtrlAltDel"
-            })
+            self._call_firecracker_api(
+                sandbox_id, "PUT", "/actions", {"action_type": "SendCtrlAltDel"}
+            )
             await asyncio.sleep(1)
         except Exception:
             pass
@@ -468,16 +557,19 @@ class SandboxManager:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         # Pause the VM first
-        self._call_firecracker_api(sandbox_id, "PATCH", "/vm", {
-            "state": "Paused"
-        })
+        self._call_firecracker_api(sandbox_id, "PATCH", "/vm", {"state": "Paused"})
 
         # Create snapshot via Firecracker API
-        self._call_firecracker_api(sandbox_id, "PUT", "/snapshot/create", {
-            "snapshot_type": "Full",
-            "snapshot_path": str(snapshot_dir / "snapshot"),
-            "mem_file_path": str(snapshot_dir / "memory")
-        })
+        self._call_firecracker_api(
+            sandbox_id,
+            "PUT",
+            "/snapshot/create",
+            {
+                "snapshot_type": "Full",
+                "snapshot_path": str(snapshot_dir / "snapshot"),
+                "mem_file_path": str(snapshot_dir / "memory"),
+            },
+        )
 
         # Update state
         config.status = "paused"
@@ -510,7 +602,7 @@ class SandboxManager:
             [self.FIRECRACKER_BIN, "--api-sock", str(socket_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=str(sandbox_dir)
+            cwd=str(sandbox_dir),
         )
 
         # Wait for socket
@@ -523,15 +615,20 @@ class SandboxManager:
             raise Exception("Firecracker socket not ready")
 
         # Load snapshot
-        self._call_firecracker_api(sandbox_id, "PUT", "/snapshot/load", {
-            "snapshot_path": str(snapshot_dir / "snapshot"),
-            "mem_backend": {
-                "backend_type": "File",
-                "backend_path": str(snapshot_dir / "memory")
+        self._call_firecracker_api(
+            sandbox_id,
+            "PUT",
+            "/snapshot/load",
+            {
+                "snapshot_path": str(snapshot_dir / "snapshot"),
+                "mem_backend": {
+                    "backend_type": "File",
+                    "backend_path": str(snapshot_dir / "memory"),
+                },
+                "enable_diff_snapshots": False,
+                "resume_vm": True,
             },
-            "enable_diff_snapshots": False,
-            "resume_vm": True
-        })
+        )
 
         # Update state
         config.status = "running"
@@ -562,8 +659,9 @@ class SandboxManager:
             self._vsock_clients[sandbox_id] = client
         return self._vsock_clients[sandbox_id]
 
-    async def exec_command(self, sandbox_id: str, command: str,
-                          timeout: int = 300, working_dir: str = "/workspace") -> dict:
+    async def exec_command(
+        self, sandbox_id: str, command: str, timeout: int = 300, working_dir: str = "/workspace"
+    ) -> dict:
         """Execute a command in the sandbox."""
         client = self._get_vsock_client(sandbox_id)
         return client.exec_command(command, timeout, working_dir)
@@ -573,8 +671,9 @@ class SandboxManager:
         client = self._get_vsock_client(sandbox_id)
         return client.read_file(path)
 
-    async def write_file(self, sandbox_id: str, path: str,
-                        content: str, is_base64: bool = False) -> dict:
+    async def write_file(
+        self, sandbox_id: str, path: str, content: str, is_base64: bool = False
+    ) -> dict:
         """Write a file to the sandbox."""
         client = self._get_vsock_client(sandbox_id)
         return client.write_file(path, content, is_base64)
