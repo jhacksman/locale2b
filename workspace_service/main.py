@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from .config import get_config
 from .sandbox_manager import SandboxManager
+from .security import SecurityMiddleware, get_security_config, require_valid_path
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +30,9 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Add security middleware (must be added before CORS)
+app.add_middleware(SecurityMiddleware)
+
 # Add CORS middleware for web clients
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +44,20 @@ app.add_middleware(
 
 # Global sandbox manager instance
 sandbox_manager = SandboxManager()
+
+# Log security configuration on startup
+@app.on_event("startup")
+async def log_security_config():
+    """Log security configuration on startup."""
+    config = get_security_config()
+    logger.info(f"Security: API key auth {'enabled' if config.api_key_enabled else 'disabled'}")
+    logger.info(f"Security: Rate limiting {'enabled' if config.rate_limit_enabled else 'disabled'}")
+    if config.rate_limit_enabled:
+        logger.info(
+            f"Security: Rate limit {config.rate_limit_requests} requests "
+            f"per {config.rate_limit_window_seconds}s"
+        )
+    logger.info(f"Security: Max request size {config.max_request_size_bytes} bytes")
 
 
 # Request/Response Models
@@ -328,6 +346,9 @@ async def write_file(sandbox_id: str, request: FileWriteRequest):
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
 
+    # Validate path for security
+    require_valid_path(request.path)
+
     try:
         result = await sandbox_manager.write_file(
             sandbox_id=sandbox_id,
@@ -351,6 +372,9 @@ async def read_file(sandbox_id: str, path: str):
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
 
+    # Validate path for security
+    require_valid_path(path)
+
     try:
         result = await sandbox_manager.read_file(sandbox_id=sandbox_id, path=path)
         return FileReadResponse(
@@ -367,6 +391,9 @@ async def list_files(sandbox_id: str, path: str = "/workspace"):
     """List files in a directory."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    # Validate path for security
+    require_valid_path(path)
 
     try:
         result = await sandbox_manager.list_files(sandbox_id=sandbox_id, path=path)
@@ -387,6 +414,9 @@ async def upload_file(sandbox_id: str, path: str, file: UploadFile = File(...)):
     """Upload a file to the sandbox."""
     if sandbox_id not in sandbox_manager._active_sandboxes:
         raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    # Validate path for security
+    require_valid_path(path)
 
     try:
         content = await file.read()
