@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ExposedPort:
+    """Information about an exposed port."""
+
+    port: int
+    url: str
+    tunnel_pid: Optional[int] = None
+
+
+@dataclass
 class SandboxConfig:
     """Configuration and state for a sandbox."""
 
@@ -38,6 +48,7 @@ class SandboxConfig:
     ip_address: Optional[str] = None
     vsock_cid: Optional[int] = None
     firecracker_pid: Optional[int] = None
+    exposed_ports: Optional[Dict[int, dict]] = None  # port -> {url, tunnel_pid}
 
 
 class VsockClient:
@@ -606,6 +617,9 @@ class SandboxManager:
         sandbox_dir = self._get_sandbox_dir(sandbox_id)
         config = self._active_sandboxes.get(sandbox_id)
 
+        # Clean up exposed ports (kill cloudflared tunnels)
+        await self._cleanup_exposed_ports(sandbox_id)
+
         # Disconnect vsock client
         if sandbox_id in self._vsock_clients:
             self._vsock_clients[sandbox_id].disconnect()
@@ -783,3 +797,176 @@ class SandboxManager:
         """List files in a directory."""
         client = self._get_vsock_client(sandbox_id)
         return client.list_files(path)
+
+    async def expose_port(self, sandbox_id: str, port: int) -> dict:
+        """Expose a port from the sandbox using cloudflared tunnel.
+
+        This runs cloudflared inside the sandbox to create a tunnel to the
+        specified port, returning a public URL that can be used to access
+        the service.
+
+        Args:
+            sandbox_id: ID of the sandbox
+            port: Port number to expose (e.g., 3000, 8080)
+
+        Returns:
+            Dict with 'url' key containing the public trycloudflare.com URL
+        """
+        config = self._active_sandboxes.get(sandbox_id)
+        if not config:
+            raise ValueError(f"Sandbox not found: {sandbox_id}")
+
+        # Initialize exposed_ports if needed
+        if config.exposed_ports is None:
+            config.exposed_ports = {}
+
+        # Check if port is already exposed
+        if port in config.exposed_ports:
+            return {"url": config.exposed_ports[port]["url"], "already_exposed": True}
+
+        # Run cloudflared tunnel in the background inside the sandbox
+        # The command outputs the URL to stderr, so we capture it
+        client = self._get_vsock_client(sandbox_id)
+
+        # First, check if cloudflared is installed
+        check_result = client.exec_command("which cloudflared", timeout=5)
+        if check_result.get("exit_code") != 0:
+            raise ValueError(
+                "cloudflared not installed in sandbox. "
+                "Please update the rootfs to include cloudflared."
+            )
+
+        # Start cloudflared tunnel in background and capture the URL
+        # cloudflared outputs the URL to stderr in format:
+        # "... https://xxx.trycloudflare.com ..."
+        tunnel_cmd = (
+            f"nohup cloudflared tunnel --url http://localhost:{port} "
+            f"> /tmp/cloudflared-{port}.log 2>&1 & "
+            f"echo $!"
+        )
+        result = client.exec_command(tunnel_cmd, timeout=10)
+
+        if result.get("exit_code") != 0:
+            raise Exception(f"Failed to start cloudflared: {result.get('stderr', '')}")
+
+        tunnel_pid = int(result.get("stdout", "").strip()) if result.get("stdout") else None
+
+        # Wait a moment for cloudflared to establish the tunnel and output the URL
+        await asyncio.sleep(3)
+
+        # Read the log file to get the URL
+        log_result = client.exec_command(f"cat /tmp/cloudflared-{port}.log", timeout=5)
+        log_content = log_result.get("stdout", "") + log_result.get("stderr", "")
+
+        # Parse the URL from the log output
+        # cloudflared outputs something like:
+        # "... https://random-words.trycloudflare.com ..."
+        url_match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_content)
+
+        if not url_match:
+            # Try waiting a bit longer and check again
+            await asyncio.sleep(3)
+            log_result = client.exec_command(f"cat /tmp/cloudflared-{port}.log", timeout=5)
+            log_content = log_result.get("stdout", "") + log_result.get("stderr", "")
+            url_match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_content)
+
+        if not url_match:
+            # Kill the tunnel process if we couldn't get the URL
+            if tunnel_pid:
+                client.exec_command(f"kill {tunnel_pid}", timeout=5)
+            raise Exception(
+                f"Failed to get tunnel URL from cloudflared. Log: {log_content[:500]}"
+            )
+
+        url = url_match.group(0)
+
+        # Store the exposed port info
+        config.exposed_ports[port] = {
+            "url": url,
+            "tunnel_pid": tunnel_pid
+        }
+
+        # Save state
+        sandbox_dir = self._get_sandbox_dir(sandbox_id)
+        state_file = sandbox_dir / "state.json"
+        state_file.write_text(json.dumps(asdict(config)))
+
+        logger.info(f"Exposed port {port} on sandbox {sandbox_id} at {url}")
+        return {"url": url, "port": port, "tunnel_pid": tunnel_pid}
+
+    async def list_exposed_ports(self, sandbox_id: str) -> list:
+        """List all exposed ports for a sandbox.
+
+        Returns:
+            List of dicts with port info: [{port, url, tunnel_pid}, ...]
+        """
+        config = self._active_sandboxes.get(sandbox_id)
+        if not config:
+            raise ValueError(f"Sandbox not found: {sandbox_id}")
+
+        if not config.exposed_ports:
+            return []
+
+        return [
+            {"port": port, "url": info["url"], "tunnel_pid": info.get("tunnel_pid")}
+            for port, info in config.exposed_ports.items()
+        ]
+
+    async def close_port(self, sandbox_id: str, port: int) -> bool:
+        """Close an exposed port by killing the cloudflared tunnel.
+
+        Args:
+            sandbox_id: ID of the sandbox
+            port: Port number to close
+
+        Returns:
+            True if port was closed successfully
+        """
+        config = self._active_sandboxes.get(sandbox_id)
+        if not config:
+            raise ValueError(f"Sandbox not found: {sandbox_id}")
+
+        if not config.exposed_ports or port not in config.exposed_ports:
+            raise ValueError(f"Port {port} is not exposed")
+
+        port_info = config.exposed_ports[port]
+        tunnel_pid = port_info.get("tunnel_pid")
+
+        # Kill the tunnel process
+        if tunnel_pid:
+            client = self._get_vsock_client(sandbox_id)
+            client.exec_command(f"kill {tunnel_pid}", timeout=5)
+
+        # Remove from exposed ports
+        del config.exposed_ports[port]
+
+        # Save state
+        sandbox_dir = self._get_sandbox_dir(sandbox_id)
+        state_file = sandbox_dir / "state.json"
+        state_file.write_text(json.dumps(asdict(config)))
+
+        logger.info(f"Closed port {port} on sandbox {sandbox_id}")
+        return True
+
+    async def _cleanup_exposed_ports(self, sandbox_id: str):
+        """Clean up all exposed ports for a sandbox (called during destroy)."""
+        config = self._active_sandboxes.get(sandbox_id)
+        if not config or not config.exposed_ports:
+            return
+
+        client = None
+        try:
+            client = self._get_vsock_client(sandbox_id)
+        except Exception:
+            # If we can't connect, the sandbox is probably already down
+            return
+
+        for port, info in config.exposed_ports.items():
+            tunnel_pid = info.get("tunnel_pid")
+            if tunnel_pid:
+                try:
+                    client.exec_command(f"kill {tunnel_pid}", timeout=5)
+                except Exception:
+                    pass
+
+        config.exposed_ports = {}

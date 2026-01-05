@@ -237,6 +237,13 @@ apk add --no-cache \
     xz
 CHROOT_EOF
 
+# Install cloudflared for port forwarding/tunneling
+echo "   Installing cloudflared for port forwarding..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+# cloudflared is available in Alpine community repo
+apk add --no-cache cloudflared
+CHROOT_EOF
+
 # 5. Install guest agent
 echo "5. Installing guest agent..."
 mkdir -p "$MOUNT_POINT/opt/agent"
@@ -315,6 +322,7 @@ Tools:
   - Build tools (gcc, make, cmake)
   - Networking (dhcpcd, dig, ping)
   - Entropy (haveged) + Time sync (chrony)
+  - Port forwarding (cloudflared)
 
 Network: eth0 (DHCP enabled)
 Workspace: /workspace
@@ -371,5 +379,6 @@ echo "  ✓ Build tools (gcc, make, cmake)"
 echo "  ✓ Network enabled (DHCP on eth0)"
 echo "  ✓ Entropy daemon (haveged) for TLS"
 echo "  ✓ Time sync (chrony) for certificate validation"
+echo "  ✓ Port forwarding (cloudflared) for web previews"
 echo "  ✓ Git + all dev tools"
 echo ""
