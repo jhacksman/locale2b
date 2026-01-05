@@ -78,10 +78,19 @@ echo "   ✓ NAT configured"
 # 5. Set up DHCP server (dnsmasq) for VMs
 echo "5. Setting up DHCP server (dnsmasq)..."
 
+# Check if dnsmasq package is installed (not just the command)
+DNSMASQ_INSTALLED=false
+if command -v dpkg &> /dev/null; then
+    dpkg -l | grep -q "^ii.*dnsmasq" && DNSMASQ_INSTALLED=true
+elif command -v rpm &> /dev/null; then
+    rpm -q dnsmasq &> /dev/null && DNSMASQ_INSTALLED=true
+fi
+
 # Install dnsmasq if not present
-if ! command -v dnsmasq &> /dev/null; then
+if [ "$DNSMASQ_INSTALLED" = false ]; then
     echo "   Installing dnsmasq..."
     if command -v apt-get &> /dev/null; then
+        apt-get update
         apt-get install -y dnsmasq
     elif command -v dnf &> /dev/null; then
         dnf install -y dnsmasq
@@ -91,6 +100,9 @@ if ! command -v dnsmasq &> /dev/null; then
         echo "   Error: Could not find package manager to install dnsmasq"
         exit 1
     fi
+    echo "   ✓ dnsmasq installed"
+else
+    echo "   dnsmasq already installed"
 fi
 
 # Configure dnsmasq for the bridge
@@ -120,10 +132,16 @@ log-dhcp
 dhcp-lease-max=65000
 EOF
 
-# Restart dnsmasq
-systemctl restart dnsmasq
+# Start/restart dnsmasq
+if systemctl is-active --quiet dnsmasq; then
+    systemctl restart dnsmasq
+    echo "   ✓ dnsmasq restarted"
+else
+    systemctl start dnsmasq
+    echo "   ✓ dnsmasq started"
+fi
 systemctl enable dnsmasq
-echo "   ✓ DHCP server configured and started"
+echo "   ✓ DHCP server configured"
 
 # 6. Install iptables-persistent (optional, for persistence across reboots)
 echo "6. Checking iptables persistence..."
