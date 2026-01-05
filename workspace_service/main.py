@@ -434,6 +434,111 @@ async def upload_file(sandbox_id: str, path: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Port forwarding endpoints
+
+
+class ExposePortRequest(BaseModel):
+    port: int
+
+
+class ExposedPortResponse(BaseModel):
+    port: int
+    url: str
+    tunnel_pid: Optional[int] = None
+    already_exposed: bool = False
+
+
+class ExposedPortListResponse(BaseModel):
+    ports: List[ExposedPortResponse]
+
+
+@app.post("/sandboxes/{sandbox_id}/ports/expose", response_model=ExposedPortResponse)
+async def expose_port(sandbox_id: str, request: ExposePortRequest):
+    """Expose a port from the sandbox to the internet via cloudflared tunnel.
+
+    This creates a public URL (*.trycloudflare.com) that tunnels traffic
+    to the specified port inside the sandbox. Useful for previewing web
+    applications running in the sandbox.
+
+    Args:
+        sandbox_id: ID of the sandbox
+        request: Contains the port number to expose
+
+    Returns:
+        ExposedPortResponse with the public URL
+
+    Raises:
+        404: Sandbox not found
+        400: cloudflared not installed in sandbox
+        500: Failed to create tunnel
+    """
+    if sandbox_id not in sandbox_manager._active_sandboxes:
+        raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    try:
+        result = await sandbox_manager.expose_port(sandbox_id, request.port)
+        return ExposedPortResponse(
+            port=result.get("port", request.port),
+            url=result["url"],
+            tunnel_pid=result.get("tunnel_pid"),
+            already_exposed=result.get("already_exposed", False),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to expose port {request.port} on sandbox {sandbox_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sandboxes/{sandbox_id}/ports", response_model=ExposedPortListResponse)
+async def list_exposed_ports(sandbox_id: str):
+    """List all exposed ports for a sandbox.
+
+    Returns:
+        ExposedPortListResponse with list of exposed ports and their URLs
+    """
+    if sandbox_id not in sandbox_manager._active_sandboxes:
+        raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    try:
+        ports = await sandbox_manager.list_exposed_ports(sandbox_id)
+        return ExposedPortListResponse(
+            ports=[
+                ExposedPortResponse(
+                    port=p["port"],
+                    url=p["url"],
+                    tunnel_pid=p.get("tunnel_pid"),
+                )
+                for p in ports
+            ]
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sandboxes/{sandbox_id}/ports/{port}")
+async def close_port(sandbox_id: str, port: int):
+    """Close an exposed port by killing the cloudflared tunnel.
+
+    Args:
+        sandbox_id: ID of the sandbox
+        port: Port number to close
+
+    Returns:
+        Status message confirming port was closed
+    """
+    if sandbox_id not in sandbox_manager._active_sandboxes:
+        raise HTTPException(status_code=404, detail="Sandbox not found")
+
+    try:
+        await sandbox_manager.close_port(sandbox_id, port)
+        return {"status": "closed", "port": port}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def main():
     """Main entry point for the workspace-service console script."""
     import uvicorn
