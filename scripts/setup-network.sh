@@ -17,8 +17,8 @@ fi
 
 # Configuration
 BRIDGE_NAME="fc-br0"
-BRIDGE_IP="172.16.0.1/24"
-BRIDGE_NETWORK="172.16.0.0/24"
+BRIDGE_IP="172.16.0.1/16"  # /16 = 65,534 usable IPs
+BRIDGE_NETWORK="172.16.0.0/16"
 
 # 1. Check if bridge already exists
 echo "1. Checking for existing bridge..."
@@ -99,8 +99,9 @@ cat > /etc/dnsmasq.d/firecracker-bridge.conf << EOF
 interface=$BRIDGE_NAME
 bind-interfaces
 
-# DHCP range: 172.16.0.10 - 172.16.0.250
-dhcp-range=172.16.0.10,172.16.0.250,255.255.255.0,12h
+# DHCP range: 172.16.1.0 - 172.16.255.254 (65,024 IPs for ~10k+ VMs)
+# Using /16 subnet for massive scale
+dhcp-range=172.16.1.0,172.16.255.254,255.255.0.0,12h
 
 # Gateway is the bridge IP
 dhcp-option=3,172.16.0.1
@@ -114,6 +115,9 @@ no-hosts
 
 # Log DHCP requests (helpful for debugging)
 log-dhcp
+
+# Increase DHCP lease cache for many VMs
+dhcp-lease-max=65000
 EOF
 
 # Restart dnsmasq
@@ -191,7 +195,11 @@ echo "Bridge: $BRIDGE_NAME ($BRIDGE_IP)"
 echo "VM Network: $BRIDGE_NETWORK"
 echo "NAT Interface: $PRIMARY_IFACE"
 echo ""
-echo "VMs will get IPs in the 172.16.0.0/24 range via DHCP"
+echo "DHCP Range: 172.16.1.0 - 172.16.255.254 (65,024 IPs)"
+echo "Gateway: 172.16.0.1"
+echo "DNS: 8.8.8.8, 8.8.4.4"
+echo ""
+echo "Capacity: ~65,000 concurrent VMs with unique IPs"
 echo "VMs will have internet access through $PRIMARY_IFACE"
 echo ""
 echo "Test with:"
