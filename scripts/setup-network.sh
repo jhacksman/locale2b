@@ -78,6 +78,12 @@ echo "   ✓ NAT configured"
 # 5. Set up DHCP server (dnsmasq) for VMs
 echo "5. Setting up DHCP server (dnsmasq)..."
 
+# Verify bridge is up before configuring dnsmasq
+if ! ip link show "$BRIDGE_NAME" &> /dev/null; then
+    echo "   Error: Bridge $BRIDGE_NAME does not exist. Cannot configure dnsmasq."
+    exit 1
+fi
+
 # Check if dnsmasq package is installed (not just the command)
 DNSMASQ_INSTALLED=false
 if command -v dpkg &> /dev/null; then
@@ -104,6 +110,9 @@ if [ "$DNSMASQ_INSTALLED" = false ]; then
 else
     echo "   dnsmasq already installed"
 fi
+
+# Ensure dnsmasq.d directory exists
+mkdir -p /etc/dnsmasq.d
 
 # Configure dnsmasq for the bridge
 cat > /etc/dnsmasq.d/firecracker-bridge.conf << EOF
@@ -132,15 +141,45 @@ log-dhcp
 dhcp-lease-max=65000
 EOF
 
-# Start/restart dnsmasq
-if systemctl is-active --quiet dnsmasq; then
-    systemctl restart dnsmasq
-    echo "   ✓ dnsmasq restarted"
-else
-    systemctl start dnsmasq
-    echo "   ✓ dnsmasq started"
+# Check if dnsmasq.service exists in systemd
+# On some distros (Fedora), dnsmasq is installed but no systemd unit exists
+DNSMASQ_SERVICE="dnsmasq"
+if ! systemctl list-unit-files "${DNSMASQ_SERVICE}.service" &> /dev/null; then
+    echo "   Creating custom dnsmasq systemd service (not provided by distro)..."
+    DNSMASQ_SERVICE="firecracker-dnsmasq"
+    cat > /etc/systemd/system/firecracker-dnsmasq.service << EOF
+[Unit]
+Description=DHCP/DNS for Firecracker VMs
+After=network.target firecracker-network.service
+Requires=firecracker-network.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-dir=/etc/dnsmasq.d --pid-file=/run/firecracker-dnsmasq.pid
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    echo "   ✓ Custom dnsmasq service created"
 fi
-systemctl enable dnsmasq
+
+# Stop any existing dnsmasq instances that might conflict
+systemctl stop dnsmasq 2>/dev/null || true
+systemctl stop firecracker-dnsmasq 2>/dev/null || true
+
+# Start the appropriate dnsmasq service
+echo "   Starting ${DNSMASQ_SERVICE}..."
+if systemctl start "${DNSMASQ_SERVICE}"; then
+    systemctl enable "${DNSMASQ_SERVICE}"
+    echo "   ✓ ${DNSMASQ_SERVICE} started and enabled"
+else
+    echo "   Error: Failed to start ${DNSMASQ_SERVICE}"
+    echo "   Check logs with: journalctl -u ${DNSMASQ_SERVICE} -n 20"
+    exit 1
+fi
 echo "   ✓ DHCP server configured"
 
 # 6. Install iptables-persistent (optional, for persistence across reboots)
