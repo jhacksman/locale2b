@@ -245,6 +245,32 @@ systemctl enable firecracker-network.service
 systemctl start firecracker-network.service
 echo "   ✓ systemd service created and enabled"
 
+# 9. Configure sudoers for TAP device management
+echo "9. Configuring sudoers for TAP device management..."
+
+# Detect the user who will run the workspace service
+# Default to the user who invoked sudo, or 'nobody' if run directly as root
+SERVICE_USER="${SUDO_USER:-nobody}"
+
+# Create sudoers file for passwordless ip commands
+# This is required because the workspace service creates TAP devices dynamically
+SUDOERS_FILE="/etc/sudoers.d/locale2b"
+if [ ! -f "$SUDOERS_FILE" ]; then
+    cat > "$SUDOERS_FILE" << EOF
+# Allow locale2b workspace service to manage TAP devices without password
+# This is required for dynamic TAP device creation/deletion when sandboxes are created/destroyed
+$SERVICE_USER ALL=(ALL) NOPASSWD: /usr/sbin/ip
+$SERVICE_USER ALL=(ALL) NOPASSWD: /sbin/ip
+EOF
+    chmod 440 "$SUDOERS_FILE"
+    echo "   ✓ Sudoers configured for user: $SERVICE_USER"
+    echo "   ✓ Passwordless sudo enabled for: /usr/sbin/ip, /sbin/ip"
+else
+    echo "   Sudoers file already exists: $SUDOERS_FILE"
+    echo "   Current contents:"
+    cat "$SUDOERS_FILE" | sed 's/^/      /'
+fi
+
 echo ""
 echo "=== Network Setup Complete ==="
 echo ""
@@ -258,6 +284,9 @@ echo "DNS: 8.8.8.8, 8.8.4.4"
 echo ""
 echo "Capacity: ~65,000 concurrent VMs with unique IPs"
 echo "VMs will have internet access through $PRIMARY_IFACE"
+echo ""
+echo "Sudoers configured for user: $SERVICE_USER"
+echo "  (Change SERVICE_USER in script if running service as different user)"
 echo ""
 echo "Test with:"
 echo "  ping 172.16.0.1  (should reach the bridge)"

@@ -208,6 +208,33 @@ sudo modprobe tun
 ls -la /dev/net/tun
 ```
 
+### TAP Device Creation Hangs (Systemd Service)
+
+If the workspace service hangs when creating sandboxes (especially when run as a systemd service), it's likely because `sudo ip ...` commands are waiting for a password prompt that can't be displayed.
+
+**Solution**: Configure passwordless sudo for the `ip` command:
+
+```bash
+# The setup-network.sh script does this automatically, but if you need to do it manually:
+sudo visudo -f /etc/sudoers.d/locale2b
+
+# Add these lines (replace 'youruser' with the user running the service):
+youruser ALL=(ALL) NOPASSWD: /usr/sbin/ip
+youruser ALL=(ALL) NOPASSWD: /sbin/ip
+```
+
+**Verify it works**:
+```bash
+# This should work without prompting for password:
+sudo ip link show
+```
+
+**Check service logs for this issue**:
+```bash
+sudo journalctl -u locale2b -f
+# Look for hung processes or timeout errors during sandbox creation
+```
+
 ## Security Considerations
 
 ### Isolation

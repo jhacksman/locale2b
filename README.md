@@ -80,6 +80,8 @@ This enables VMs to:
 - Access the internet (pip install, git clone, npm install, etc.)
 - Communicate with each other
 
+The script also configures **passwordless sudo for the `ip` command**, which is required for the workspace service to create TAP devices dynamically. Without this, the service will hang when creating sandboxes (especially when run as a systemd service).
+
 **Note**: Without this, VMs will boot but won't have network connectivity.
 
 ### 4. Start the Service
