@@ -2,6 +2,25 @@
 
 This guide explains how to configure networking for Firecracker VMs so they can access the internet.
 
+## Quick Install / Uninstall
+
+**Install networking (one-time setup):**
+```bash
+sudo ./scripts/setup-network.sh
+```
+
+**Uninstall networking (to start fresh or change configuration):**
+```bash
+sudo ./scripts/uninstall-network.sh
+```
+
+**Reinstall (if you need to change settings):**
+```bash
+sudo ./scripts/uninstall-network.sh
+# Edit scripts/setup-network.sh if needed
+sudo ./scripts/setup-network.sh
+```
+
 ## Overview
 
 By default, Firecracker VMs are isolated and have no network connectivity. To enable internet access:
