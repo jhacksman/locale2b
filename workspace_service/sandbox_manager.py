@@ -335,8 +335,9 @@ class SandboxManager:
 
             if result.returncode != 0:
                 # Create TAP device
+                # Note: Requires CAP_NET_ADMIN capability (provided by systemd service)
                 subprocess.run(
-                    ["sudo", "ip", "tuntap", "add", tap_name, "mode", "tap"],
+                    ["ip", "tuntap", "add", tap_name, "mode", "tap"],
                     check=True,
                     capture_output=True
                 )
@@ -350,14 +351,14 @@ class SandboxManager:
 
                 if bridge_check.returncode == 0:
                     subprocess.run(
-                        ["sudo", "ip", "link", "set", tap_name, "master", bridge_name],
+                        ["ip", "link", "set", tap_name, "master", bridge_name],
                         check=True,
                         capture_output=True
                     )
 
                 # Bring up the interface
                 subprocess.run(
-                    ["sudo", "ip", "link", "set", tap_name, "up"],
+                    ["ip", "link", "set", tap_name, "up"],
                     check=True,
                     capture_output=True
                 )
@@ -627,10 +628,11 @@ class SandboxManager:
                 pass
 
         # Clean up TAP device
+        # Note: Requires CAP_NET_ADMIN capability (provided by systemd service)
         tap_name = f"fc-{sandbox_id[:8]}"
         try:
             subprocess.run(
-                ["sudo", "ip", "link", "delete", tap_name],
+                ["ip", "link", "delete", tap_name],
                 capture_output=True,
                 check=False
             )

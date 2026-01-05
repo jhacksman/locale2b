@@ -84,11 +84,26 @@ This enables VMs to:
 
 ### 4. Start the Service
 
+**Option A: Run as a systemd service (recommended for production)**
+
+```bash
+# Install and start the systemd service
+sudo ./systemd/install-service.sh
+
+# View logs
+sudo journalctl -u locale2b -f
+```
+
+The systemd service uses Linux capabilities (`CAP_NET_ADMIN`) to manage TAP devices without requiring root privileges or sudo configuration.
+
+**Option B: Run manually (for development)**
+
 ```bash
 # Activate virtual environment
 source .venv/bin/activate
 
-# Start the service
+# Start the service (requires CAP_NET_ADMIN for networking)
+# Either run as root, or use: sudo setcap cap_net_admin+ep .venv/bin/python
 uvicorn workspace_service.main:app --host 0.0.0.0 --port 8080
 ```
 
