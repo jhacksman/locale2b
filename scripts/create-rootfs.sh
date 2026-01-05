@@ -96,8 +96,7 @@ apk add --no-cache \
     git \
     openssh-client \
     ca-certificates \
-    openrc \
-    busybox-initscripts
+    openrc
 CHROOT_EOF
 
 # 5. Install guest agent
