@@ -75,7 +75,8 @@ curl -fsSL "$ALPINE_URL" | tar -xz -C "$MOUNT_POINT"
 # 4. Configure the system
 echo "4. Configuring system..."
 
-# Set up resolv.conf
+# Set up resolv.conf - use DHCP-provided DNS (will be overwritten by dhcpcd)
+# Fallback to Google DNS if DHCP doesn't provide DNS
 echo "nameserver 8.8.8.8" > "$MOUNT_POINT/etc/resolv.conf"
 
 # Set up repositories
@@ -105,7 +106,12 @@ apk add --no-cache \
     bind-tools \
     iproute2 \
     iptables \
-    dhcpcd
+    dhcpcd \
+    haveged \
+    chrony
+
+# Update CA certificates bundle
+update-ca-certificates
 CHROOT_EOF
 
 # Install Python stack
@@ -275,10 +281,14 @@ iface eth0 inet dhcp
     hostname firecracker-vm
 EOF
 
-# Enable networking service
+# Enable networking and entropy services
 chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
 rc-update add networking boot
 rc-update add dhcpcd default
+# haveged provides entropy for TLS (Firecracker doesn't support virtio-rng)
+rc-update add haveged boot
+# chrony provides time sync (needed for TLS certificate validation)
+rc-update add chronyd default
 CHROOT_EOF
 
 # 7. Create workspace directory
@@ -304,6 +314,7 @@ Tools:
   - Docker CLI, database clients
   - Build tools (gcc, make, cmake)
   - Networking (dhcpcd, dig, ping)
+  - Entropy (haveged) + Time sync (chrony)
 
 Network: eth0 (DHCP enabled)
 Workspace: /workspace
@@ -358,5 +369,7 @@ echo "  ✓ Database clients (psql, mysql, sqlite, redis)"
 echo "  ✓ Docker CLI"
 echo "  ✓ Build tools (gcc, make, cmake)"
 echo "  ✓ Network enabled (DHCP on eth0)"
+echo "  ✓ Entropy daemon (haveged) for TLS"
+echo "  ✓ Time sync (chrony) for certificate validation"
 echo "  ✓ Git + all dev tools"
 echo ""
