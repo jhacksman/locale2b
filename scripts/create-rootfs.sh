@@ -96,7 +96,6 @@ apk add --no-cache \
     openssh-client \
     ca-certificates \
     openrc \
-    busybox-initscripts \
     nano \
     vim \
     htop \
