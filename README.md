@@ -54,14 +54,35 @@ chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-### 2. Create Rootfs Image
+### 2. Create Ultimate All-in-One Rootfs Image
 
 ```bash
-# Create the base rootfs with guest agent (requires root)
+# Create the comprehensive rootfs with all runtimes and tools (requires root)
+# This takes ~15-20 minutes but you only do it once
 sudo ./scripts/create-rootfs.sh
 ```
 
-### 3. Start the Service
+This creates a 3GB rootfs image with:
+- **Languages**: Python 3.11, Node.js 20, Go 1.21, Rust, Ruby 3.2
+- **Tools**: Git, Docker CLI, database clients, build tools
+- **Network**: DHCP enabled by default for internet access
+- **Pre-installed packages**: pip, npm, yarn, cargo, bundler, and common libraries
+
+### 3. Set Up Networking (Optional but Recommended)
+
+```bash
+# Set up bridge and NAT for VM internet access (requires root)
+sudo ./scripts/setup-network.sh
+```
+
+This enables VMs to:
+- Get IP addresses via DHCP
+- Access the internet (pip install, git clone, npm install, etc.)
+- Communicate with each other
+
+**Note**: Without this, VMs will boot but won't have network connectivity.
+
+### 4. Start the Service
 
 ```bash
 # Activate virtual environment
@@ -71,11 +92,23 @@ source .venv/bin/activate
 uvicorn workspace_service.main:app --host 0.0.0.0 --port 8080
 ```
 
-### 4. Test
+### 5. Test
 
 ```bash
 # Run test script
 ./scripts/test-sandbox.sh
+
+# Or test manually:
+curl -X POST http://localhost:8080/sandboxes \
+  -H "Content-Type: application/json" \
+  -d '{"memory_mb": 512, "vcpu_count": 1}'
+
+# Note the sandbox_id from response, then test network:
+curl -X POST http://localhost:8080/sandboxes/{SANDBOX_ID}/exec \
+  -H "Content-Type: application/json" \
+  -d '{"command": "ping -c 3 8.8.8.8"}'
+
+# Should show successful pings if networking is configured
 ```
 
 ## API Reference

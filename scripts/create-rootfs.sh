@@ -1,14 +1,15 @@
 #!/bin/bash
-# Create a rootfs image with the guest agent
-# This script creates an Alpine Linux-based rootfs with Python and the guest agent
+# Create the Ultimate All-in-One Rootfs Image
+# Includes: Python, Node.js, Go, Rust, Ruby, Docker CLI, database clients, and more
+# Network enabled by default (DHCP)
 
 set -e
 
-echo "=== Creating Rootfs Image ==="
+echo "=== Creating Ultimate All-in-One Rootfs Image ==="
 echo ""
 
 # Configuration
-ROOTFS_SIZE_MB=2048
+ROOTFS_SIZE_MB=3072  # Increased to 3GB for all runtimes
 ROOTFS_PATH="/var/lib/firecracker-workspaces/rootfs/default-rootfs.ext4"
 MOUNT_POINT="/tmp/rootfs-mount"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,12 +85,10 @@ https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/community
 EOF
 
 # Install packages using chroot
-echo "   Installing packages..."
+echo "   Installing base packages..."
 chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
 apk update
 apk add --no-cache \
-    python3 \
-    py3-pip \
     bash \
     curl \
     wget \
@@ -97,7 +96,140 @@ apk add --no-cache \
     openssh-client \
     ca-certificates \
     openrc \
-    busybox-initscripts
+    busybox-initscripts \
+    nano \
+    vim \
+    htop \
+    procps \
+    net-tools \
+    iputils \
+    bind-tools \
+    iproute2 \
+    iptables \
+    dhcpcd
+CHROOT_EOF
+
+# Install Python stack
+echo "   Installing Python 3.11 and packages..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache \
+    python3 \
+    python3-dev \
+    py3-pip \
+    py3-virtualenv \
+    gcc \
+    g++ \
+    musl-dev \
+    linux-headers \
+    libffi-dev \
+    openssl-dev
+
+# Install common Python packages
+pip3 install --no-cache-dir --break-system-packages \
+    requests \
+    httpx \
+    fastapi \
+    uvicorn \
+    pydantic \
+    python-dotenv \
+    pytest \
+    pytest-asyncio \
+    black \
+    ruff \
+    aiohttp \
+    beautifulsoup4 \
+    lxml
+CHROOT_EOF
+
+# Install Node.js stack
+echo "   Installing Node.js 20 LTS..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache nodejs npm
+
+# Install Yarn and pnpm globally
+npm install -g yarn pnpm
+
+# Install common Node packages globally
+npm install -g \
+    typescript \
+    ts-node \
+    nodemon \
+    prettier \
+    eslint \
+    pm2
+CHROOT_EOF
+
+# Install Go
+echo "   Installing Go 1.21..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache go
+
+# Set up Go environment in root's profile
+mkdir -p /root/go
+echo 'export GOPATH=/root/go' >> /root/.profile
+echo 'export PATH=$PATH:/usr/lib/go/bin:$GOPATH/bin' >> /root/.profile
+CHROOT_EOF
+
+# Install Rust
+echo "   Installing Rust and Cargo..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache \
+    rust \
+    cargo
+
+mkdir -p /root/.cargo
+CHROOT_EOF
+
+# Install Ruby
+echo "   Installing Ruby 3.2..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache \
+    ruby \
+    ruby-dev \
+    ruby-bundler \
+    ruby-json \
+    build-base
+CHROOT_EOF
+
+# Install database clients
+echo "   Installing database clients..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache \
+    postgresql-client \
+    mysql-client \
+    sqlite \
+    redis
+CHROOT_EOF
+
+# Install Docker CLI (no daemon, just client)
+echo "   Installing Docker CLI..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache docker-cli
+CHROOT_EOF
+
+# Install additional dev tools
+echo "   Installing additional dev tools..."
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+apk add --no-cache \
+    make \
+    cmake \
+    autoconf \
+    automake \
+    libtool \
+    jq \
+    yq \
+    tmux \
+    screen \
+    strace \
+    lsof \
+    file \
+    tree \
+    zip \
+    unzip \
+    tar \
+    gzip \
+    bzip2 \
+    xz
 CHROOT_EOF
 
 # 5. Install guest agent
@@ -131,13 +263,57 @@ chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
 rc-update add guest-agent default
 CHROOT_EOF
 
-# 6. Create workspace directory
-echo "6. Creating workspace directory..."
+# 6. Configure networking
+echo "6. Configuring networking (DHCP enabled)..."
+
+# Set up network interfaces for DHCP
+cat > "$MOUNT_POINT/etc/network/interfaces" << 'EOF'
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+    hostname firecracker-vm
+EOF
+
+# Enable networking service
+chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
+rc-update add networking boot
+rc-update add dhcpcd default
+CHROOT_EOF
+
+# 7. Create workspace directory
+echo "7. Creating workspace directory..."
 mkdir -p "$MOUNT_POINT/workspace"
 chmod 777 "$MOUNT_POINT/workspace"
 
-# 7. Set up init system
-echo "7. Configuring init system..."
+# 8. Create welcome message
+echo "8. Creating welcome message..."
+cat > "$MOUNT_POINT/etc/motd" << 'EOF'
+========================================
+Firecracker Workspace - Ultimate Edition
+========================================
+Languages:
+  - Python 3.11 (with pip, requests, fastapi, pytest)
+  - Node.js 20 LTS (with npm, yarn, pnpm, typescript)
+  - Go 1.21 (with GOPATH configured)
+  - Rust (with cargo)
+  - Ruby 3.2 (with bundler)
+
+Tools:
+  - Git, curl, wget, vim, nano
+  - Docker CLI, database clients
+  - Build tools (gcc, make, cmake)
+  - Networking (dhcpcd, dig, ping)
+
+Network: eth0 (DHCP enabled)
+Workspace: /workspace
+Guest Agent: vsock port 5000
+========================================
+EOF
+
+# 9. Set up init system
+echo "9. Configuring init system..."
 
 # Create inittab for serial console
 cat > "$MOUNT_POINT/etc/inittab" << 'EOF'
@@ -152,21 +328,36 @@ EOF
 # Set root password (for debugging - remove in production)
 echo "root:root" | chroot "$MOUNT_POINT" chpasswd
 
-# 8. Final cleanup inside chroot
-echo "8. Final cleanup..."
+# 10. Final cleanup inside chroot
+echo "10. Final cleanup..."
 chroot "$MOUNT_POINT" /bin/sh << 'CHROOT_EOF'
 rm -rf /var/cache/apk/*
+rm -rf /tmp/*
+rm -rf /root/.npm
+rm -rf /root/.cache
 CHROOT_EOF
 
 # Unmount
-echo "9. Unmounting..."
+echo "11. Unmounting..."
 sync
 umount "$MOUNT_POINT"
 rmdir "$MOUNT_POINT"
 trap - EXIT
 
 echo ""
-echo "=== Rootfs Created Successfully ==="
+echo "=== Ultimate All-in-One Rootfs Created Successfully ==="
 echo "Path: $ROOTFS_PATH"
 echo "Size: $(du -h "$ROOTFS_PATH" | cut -f1)"
+echo ""
+echo "Includes:"
+echo "  ✓ Python 3.11 + pip + common packages"
+echo "  ✓ Node.js 20 LTS + npm/yarn/pnpm + TypeScript"
+echo "  ✓ Go 1.21"
+echo "  ✓ Rust + Cargo"
+echo "  ✓ Ruby 3.2 + bundler"
+echo "  ✓ Database clients (psql, mysql, sqlite, redis)"
+echo "  ✓ Docker CLI"
+echo "  ✓ Build tools (gcc, make, cmake)"
+echo "  ✓ Network enabled (DHCP on eth0)"
+echo "  ✓ Git + all dev tools"
 echo ""

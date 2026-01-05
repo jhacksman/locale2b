@@ -303,6 +303,75 @@ class SandboxManager:
         self._next_vsock_cid += 1
         return cid
 
+    def _generate_mac_address(self, sandbox_id: str) -> str:
+        """Generate a deterministic MAC address for a sandbox.
+
+        Uses the format AA:FC:xx:xx:xx:xx where xx is derived from sandbox_id.
+        AA:FC is a locally administered address prefix.
+        """
+        # Use first 8 chars of sandbox_id to generate last 4 octets
+        mac_suffix = sandbox_id[:8].encode().hex()[:8]
+        mac_parts = ["AA", "FC"]
+        for i in range(0, 8, 2):
+            mac_parts.append(mac_suffix[i:i+2])
+        return ":".join(mac_parts)
+
+    def _setup_tap_device(self, sandbox_id: str) -> str:
+        """Create and configure a TAP device for the sandbox.
+
+        Returns the TAP device name.
+        """
+        tap_name = f"fc-{sandbox_id[:8]}"
+        bridge_name = "fc-br0"
+
+        try:
+            # Check if TAP device already exists
+            result = subprocess.run(
+                ["ip", "link", "show", tap_name],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                # Create TAP device
+                subprocess.run(
+                    ["sudo", "ip", "tuntap", "add", tap_name, "mode", "tap"],
+                    check=True,
+                    capture_output=True
+                )
+
+                # Attach to bridge (if it exists)
+                bridge_check = subprocess.run(
+                    ["ip", "link", "show", bridge_name],
+                    capture_output=True,
+                    check=False
+                )
+
+                if bridge_check.returncode == 0:
+                    subprocess.run(
+                        ["sudo", "ip", "link", "set", tap_name, "master", bridge_name],
+                        check=True,
+                        capture_output=True
+                    )
+
+                # Bring up the interface
+                subprocess.run(
+                    ["sudo", "ip", "link", "set", tap_name, "up"],
+                    check=True,
+                    capture_output=True
+                )
+
+                logger.info(f"Created TAP device: {tap_name}")
+            else:
+                logger.info(f"TAP device already exists: {tap_name}")
+
+            return tap_name
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to create TAP device {tap_name}: {e}")
+            raise
+
     def _call_firecracker_api(
         self, sandbox_id: str, method: str, endpoint: str, data: dict = None
     ) -> dict:
@@ -473,7 +542,25 @@ class SandboxManager:
                 {"vsock_id": "vsock0", "guest_cid": vsock_cid, "uds_path": str(vsock_path)},
             )
 
-            # 5. Start the VM
+            # 5. Set up network interface (if networking is enabled)
+            try:
+                tap_name = self._setup_tap_device(sandbox_id)
+                self._call_firecracker_api(
+                    sandbox_id,
+                    "PUT",
+                    "/network-interfaces/eth0",
+                    {
+                        "iface_id": "eth0",
+                        "guest_mac": self._generate_mac_address(sandbox_id),
+                        "host_dev_name": tap_name,
+                    },
+                )
+                logger.info(f"Network interface configured for sandbox {sandbox_id}: {tap_name}")
+            except Exception as e:
+                logger.warning(f"Failed to configure network for sandbox {sandbox_id}: {e}")
+                logger.warning("Sandbox will have no network connectivity")
+
+            # 6. Start the VM
             self._call_firecracker_api(
                 sandbox_id, "PUT", "/actions", {"action_type": "InstanceStart"}
             )
@@ -538,6 +625,18 @@ class SandboxManager:
                 os.kill(config.firecracker_pid, 9)
             except ProcessLookupError:
                 pass
+
+        # Clean up TAP device
+        tap_name = f"fc-{sandbox_id[:8]}"
+        try:
+            subprocess.run(
+                ["sudo", "ip", "link", "delete", tap_name],
+                capture_output=True,
+                check=False
+            )
+            logger.info(f"Cleaned up TAP device: {tap_name}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup TAP device {tap_name}: {e}")
 
         # Clean up files
         if sandbox_dir.exists():
