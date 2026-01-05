@@ -273,13 +273,75 @@ await provider.resume_workspace(sandbox_id)
 await provider.destroy_workspace()
 ```
 
-## Security Considerations
+## Security Configuration
+
+**Important:** By default, the API accepts requests without authentication. For production deployments, you should enable API key authentication.
+
+### Enabling API Key Authentication (Recommended)
+
+The systemd service is the preferred way to run locale2b in production. To enable API key authentication:
+
+**1. Edit the systemd service file:**
+
+```bash
+sudo systemctl edit locale2b --full
+```
+
+**2. Add these environment variables under `[Service]`:**
+
+```ini
+[Service]
+# ... existing configuration ...
+Environment="API_KEY_ENABLED=true"
+Environment="API_KEYS=your-secret-api-key-here"
+```
+
+You can specify multiple API keys (comma-separated):
+```ini
+Environment="API_KEYS=key1,key2,key3"
+```
+
+**3. Reload and restart the service:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart locale2b
+```
+
+**4. Verify authentication is working:**
+
+```bash
+# This should fail with 401 Unauthorized
+curl -s http://localhost:8080/sandboxes
+
+# This should succeed
+curl -s -X POST http://localhost:8080/sandboxes \
+  -H "X-API-Key: your-secret-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"memory_mb": 512}'
+```
+
+### Security Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_KEY_ENABLED` | `false` | Set to `true` to require API key authentication |
+| `API_KEYS` | (empty) | Comma-separated list of valid API keys |
+| `API_KEY_HEADER` | `X-API-Key` | HTTP header name for the API key |
+| `RATE_LIMIT_ENABLED` | `true` | Enable rate limiting (100 req/min default) |
+| `RATE_LIMIT_REQUESTS` | `100` | Max requests per time window |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit time window |
+| `MAX_REQUEST_SIZE_BYTES` | `10485760` | Max request body size (10MB) |
+
+### Additional Security Best Practices
 
 1. **Use the Jailer** in production for additional isolation
 2. **Limit network access** per sandbox as needed
 3. **Set resource limits** (CPU, memory, disk I/O)
 4. **Rotate/clean up old sandboxes** to prevent resource exhaustion
 5. **Don't run as root** - use ACLs for /dev/kvm access
+6. **Use a firewall** to restrict access to port 8080
+7. **Use HTTPS** with a reverse proxy (nginx/caddy) for encrypted connections
 
 ## Troubleshooting
 
