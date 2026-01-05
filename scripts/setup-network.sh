@@ -75,8 +75,54 @@ fi
 
 echo "   ✓ NAT configured"
 
-# 5. Install iptables-persistent (optional, for persistence across reboots)
-echo "5. Checking iptables persistence..."
+# 5. Set up DHCP server (dnsmasq) for VMs
+echo "5. Setting up DHCP server (dnsmasq)..."
+
+# Install dnsmasq if not present
+if ! command -v dnsmasq &> /dev/null; then
+    echo "   Installing dnsmasq..."
+    if command -v apt-get &> /dev/null; then
+        apt-get install -y dnsmasq
+    elif command -v dnf &> /dev/null; then
+        dnf install -y dnsmasq
+    elif command -v yum &> /dev/null; then
+        yum install -y dnsmasq
+    else
+        echo "   Error: Could not find package manager to install dnsmasq"
+        exit 1
+    fi
+fi
+
+# Configure dnsmasq for the bridge
+cat > /etc/dnsmasq.d/firecracker-bridge.conf << EOF
+# DHCP configuration for Firecracker VMs
+interface=$BRIDGE_NAME
+bind-interfaces
+
+# DHCP range: 172.16.0.10 - 172.16.0.250
+dhcp-range=172.16.0.10,172.16.0.250,255.255.255.0,12h
+
+# Gateway is the bridge IP
+dhcp-option=3,172.16.0.1
+
+# DNS servers (Google DNS)
+dhcp-option=6,8.8.8.8,8.8.4.4
+
+# Don't read /etc/resolv.conf or /etc/hosts
+no-resolv
+no-hosts
+
+# Log DHCP requests (helpful for debugging)
+log-dhcp
+EOF
+
+# Restart dnsmasq
+systemctl restart dnsmasq
+systemctl enable dnsmasq
+echo "   ✓ DHCP server configured and started"
+
+# 6. Install iptables-persistent (optional, for persistence across reboots)
+echo "6. Checking iptables persistence..."
 if ! command -v iptables-save &> /dev/null; then
     echo "   Warning: iptables-save not found, rules won't persist across reboots"
     echo "   Install iptables-persistent: apt install iptables-persistent"
@@ -88,8 +134,8 @@ else
     fi
 fi
 
-# 6. Create helper script for creating TAP devices
-echo "6. Creating TAP device helper script..."
+# 7. Create helper script for creating TAP devices
+echo "7. Creating TAP device helper script..."
 cat > /usr/local/bin/fc-create-tap << 'EOF'
 #!/bin/bash
 # Helper script to create TAP devices for Firecracker VMs
@@ -116,8 +162,8 @@ EOF
 chmod +x /usr/local/bin/fc-create-tap
 echo "   ✓ Helper script created: /usr/local/bin/fc-create-tap"
 
-# 7. Set up systemd service for network persistence (optional)
-echo "7. Creating systemd service for network persistence..."
+# 8. Set up systemd service for network persistence (optional)
+echo "8. Creating systemd service for network persistence..."
 cat > /etc/systemd/system/firecracker-network.service << EOF
 [Unit]
 Description=Firecracker Network Bridge
